@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Daguerre</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #000;
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+      font-family: Arial, sans-serif;
+    }
+
+    #video {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    #canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.7);
+      z-index: 10;
+      cursor: pointer;
+    }
+
+    #overlay h1 {
+      color: #fff;
+      font-size: clamp(22px, 5vw, 36px);
+      margin-bottom: 12px;
+      letter-spacing: 1px;
+    }
+
+    #overlay p {
+      color: #ccc;
+      font-size: clamp(14px, 3vw, 18px);
+      margin-bottom: 32px;
+    }
+
+    #startBtn {
+      background: #4f8ef7;
+      color: #fff;
+      border: none;
+      border-radius: 32px;
+      padding: 14px 36px;
+      font-size: 18px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    #startBtn:hover { background: #2f6ed4; }
+
+    #errMsg {
+      color: #f77;
+      font-size: 14px;
+      margin-top: 16px;
+      display: none;
+    }
+
+  </style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+
+<video id="charVideo" src="daguerre.mp4" autoplay loop muted playsinline
+  style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
+
+<div id="overlay">
+  <h1>Daguerre</h1>
+  <p>Allow camera access to see Daguerre</p>
+  <button id="startBtn">Start Camera</button>
+  <div id="errMsg"></div>
+</div>
+
+<script>
+// ─── Canvas setup ────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+
+function resize() {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Camera ──────────────────────────────────────────────────────────────────
+
+const video    = document.getElementById('video');
+const overlay  = document.getElementById('overlay');
+const errMsg   = document.getElementById('errMsg');
+let facingMode = 'environment';
+
+async function startCamera(mode) {
+  try {
+    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: mode }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    facingMode = mode;
+    overlay.style.display = 'none';
+  } catch (e) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      video.srcObject = stream;
+      overlay.style.display = 'none';
+    } catch (err) {
+      errMsg.textContent = 'Camera unavailable: ' + err.message;
+      errMsg.style.display = 'block';
+    }
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', () => startCamera(facingMode));
+
+// ─── WebGL chroma key ────────────────────────────────────────────────────────
+// Runs on GPU at native video resolution — no downscaling, smooth edges.
+
+const charVideo = document.getElementById('charVideo');
+
+const glCanvas = document.createElement('canvas');
+glCanvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
+document.body.appendChild(glCanvas);
+
+const gl = glCanvas.getContext('webgl',             { alpha: true, premultipliedAlpha: false })
+        || glCanvas.getContext('experimental-webgl', { alpha: true, premultipliedAlpha: false });
+
+// Vertex shader: fullscreen quad, flip Y so video is right-side up
+const VS = `
+  attribute vec2 aPos;
+  varying vec2 vUV;
+  void main() {
+    vUV = vec2(aPos.x * 0.5 + 0.5, aPos.y * 0.5 + 0.5);
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }
+`;
+
+// Fragment shader: smoothstep chroma key — soft transparent edges, no hard cutoff
+const FS = `
+  precision mediump float;
+  uniform sampler2D uTex;
+  varying vec2 vUV;
+  void main() {
+    vec4 c = texture2D(uTex, vUV);
+    // How much greener this pixel is than its red/blue channels
+    float greenness = c.g - max(c.r, c.b);
+    // Aggressive removal: starts at 0.05, fully transparent by 0.3
+    float a = 1.0 - smoothstep(0.01, 0.2, greenness);
+    // Spill suppression: cap green channel at max(r,b) on every pixel,
+    // including fully opaque ones like hair that pick up green light from the screen
+    float spill = max(0.0, greenness);
+    vec3 col = vec3(c.r, c.g - spill, c.b);
+    gl_FragColor = vec4(col, a);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(gl.VERTEX_SHADER,   VS));
+gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+// Fullscreen quad: two triangles as a strip
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(prog, 'aPos');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+// Video texture
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.clearColor(0, 0, 0, 0);
+
+let charReady = false;
+
+function initGL() {
+  if (charReady) return;
+  const vw = charVideo.videoWidth, vh = charVideo.videoHeight;
+  if (!vw || !vh) return;
+  // Use native video resolution — no quality loss
+  glCanvas.width  = vw;
+  glCanvas.height = vh;
+  gl.viewport(0, 0, vw, vh);
+  charReady = true;
+}
+
+charVideo.addEventListener('loadedmetadata', initGL);
+if (charVideo.readyState >= 1) initGL();
+charVideo.play().catch(() => {});
+
+function processCharFrame() {
+  if (!charReady || charVideo.readyState < 2) return false;
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, charVideo);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  return true;
+}
+
+// ─── Characters ──────────────────────────────────────────────────────────────
+
+let characters    = [];
+let charIdCounter = 0;
+
+function spawnCharacter(xFrac, yFrac) {
+  characters.push({
+    id:    charIdCounter++,
+    xFrac,
+    yFrac,
+    dir:   -1,
+    speed: 1,
+    scale: 3
+  });
+}
+
+spawnCharacter(0.5, 0.9);
+
+// ─── Character renderer ──────────────────────────────────────────────────────
+
+function drawCharacter(char) {
+  if (!charReady) return;
+  const { xFrac, yFrac, dir, scale } = char;
+  const gx = xFrac * canvas.width;
+  const gy = yFrac * canvas.height;
+
+  const drawH  = canvas.height * 0.30 * scale;
+  const aspect = glCanvas.width / glCanvas.height;
+  const drawW  = drawH * aspect;
+
+  ctx.save();
+  ctx.translate(gx, gy);
+  if (dir === -1) ctx.scale(-1, 1);
+  ctx.drawImage(glCanvas, -drawW / 2, -drawH, drawW, drawH);
+  ctx.restore();
+}
+
+// ─── Main loop ───────────────────────────────────────────────────────────────
+
+function loop() {
+  requestAnimationFrame(loop);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  processCharFrame();
+  drawCharacter(characters[0]);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
