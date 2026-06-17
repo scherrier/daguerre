@@ -202,9 +202,12 @@ const HORIZONTAL_FOV = 65; // approx environment-camera horizontal FOV (deg)
 const VERTICAL_FOV   = 50; // approx environment-camera vertical FOV (deg)
 const SMOOTHING       = 0.15; // exponential smoothing factor for jitter
 
-let placedOrientation = null; // { alpha, beta } captured at placement time
+let placedOrientation  = null;
 let smoothedDeltaAlpha = 0;
 let smoothedDeltaBeta  = 0;
+let currentOrientation  = null; // latest reading, used to anchor at ground-found moment
+let currentBeta         = null;
+let orientationAvailable = false;
 
 function angleDelta(a, b) {
   let d = a - b;
@@ -214,11 +217,11 @@ function angleDelta(a, b) {
 }
 
 function handleOrientation(e) {
+  orientationAvailable = true;
   if (e.alpha === null || e.beta === null) return;
-  if (!placedOrientation) {
-    placedOrientation = { alpha: e.alpha, beta: e.beta };
-    return;
-  }
+  currentBeta        = e.beta;
+  currentOrientation = { alpha: e.alpha, beta: e.beta };
+  if (!placedOrientation) return; // anchor set only when ground is found
   const rawDeltaAlpha = angleDelta(e.alpha, placedOrientation.alpha);
   const rawDeltaBeta  = e.beta - placedOrientation.beta;
   smoothedDeltaAlpha += SMOOTHING * (rawDeltaAlpha - smoothedDeltaAlpha);
@@ -243,6 +246,107 @@ function getGroundScreenPos(char) {
   const yFrac = char.yFrac - smoothedDeltaBeta  / VERTICAL_FOV;
   const visible = xFrac > -0.35 && xFrac < 1.35 && yFrac > -0.35 && yFrac < 1.35;
   return { xFrac, yFrac, visible };
+}
+
+// ─── Ground detection ────────────────────────────────────────────────────────
+// Waits for the phone to be held upright (beta in a plausible range) before
+// anchoring Daguerre and fading him in. On desktop (no orientation API) the
+// ground is considered found after a short fixed delay.
+
+const GROUND_DETECT_MS = 2000; // ms of stable valid tilt before "found"
+const BETA_MIN         = 35;   // device tilted at least 35° from flat
+const BETA_MAX         = 100;
+
+let groundFound       = false;
+let groundDetectStart = null;
+let groundOpacity     = 0;   // Daguerre fades in from 0 → 1
+let scanOpacity       = 1;   // scan indicator fades out from 1 → 0
+
+function isLookingAtGround() {
+  if (!orientationAvailable) return true; // desktop fallback: always ready
+  return currentBeta !== null && currentBeta >= BETA_MIN && currentBeta <= BETA_MAX;
+}
+
+function updateGroundDetection(ts) {
+  if (groundFound) {
+    groundOpacity = Math.min(1, groundOpacity + 0.03);
+    scanOpacity   = Math.max(0, scanOpacity   - 0.05);
+    return;
+  }
+  if (isLookingAtGround()) {
+    if (!groundDetectStart) groundDetectStart = ts;
+    if (ts - groundDetectStart >= GROUND_DETECT_MS) {
+      groundFound        = true;
+      placedOrientation  = currentOrientation ? { ...currentOrientation } : null;
+      smoothedDeltaAlpha = 0;
+      smoothedDeltaBeta  = 0;
+    }
+  } else {
+    groundDetectStart = null;
+  }
+}
+
+function drawScanIndicator(ts) {
+  if (scanOpacity <= 0) return;
+
+  const cx = canvas.width  * 0.5;
+  const cy = canvas.height * 0.84;
+  const rx = canvas.width  * 0.22;
+  const ry = canvas.height * 0.055;
+
+  const looking  = isLookingAtGround();
+  const progress = looking && groundDetectStart
+    ? Math.min(1, (ts - groundDetectStart) / GROUND_DETECT_MS)
+    : 0;
+
+  ctx.save();
+  ctx.globalAlpha = scanOpacity;
+
+  // Dashed oval representing the ground plane
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([8, 6]);
+  ctx.stroke();
+
+  // Filled arc showing detection progress
+  if (progress > 0) {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, rx, ry, -Math.PI / 2, -Math.PI / 2,
+                -Math.PI / 2 + Math.PI * 2 * progress);
+    ctx.strokeStyle = 'rgba(80, 210, 255, 0.9)';
+    ctx.lineWidth   = 3;
+    ctx.setLineDash([]);
+    ctx.stroke();
+  }
+
+  // Orbiting dots
+  const t = (ts / 900) % 1;
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2 + t * Math.PI * 2;
+    const alpha = 0.35 + 0.65 * ((i / 6 + t) % 1);
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(angle) * rx, cy + Math.sin(angle) * ry, 3, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(80, 210, 255, ${alpha})`;
+    ctx.setLineDash([]);
+    ctx.fill();
+  }
+
+  // Status label
+  const fontSize = Math.max(13, Math.round(canvas.width * 0.033));
+  ctx.font      = `${fontSize}px Arial`;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.setLineDash([]);
+  ctx.fillText(
+    groundFound ? 'Ground found!'              :
+    looking     ? 'Detecting ground surface…'  :
+                  'Point camera at the ground',
+    cx, cy + ry + fontSize + 6
+  );
+
+  ctx.restore();
 }
 
 // ─── WebGL chroma key ────────────────────────────────────────────────────────
@@ -384,12 +488,19 @@ function drawCharacter(char) {
 
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
-function loop() {
+function loop(ts) {
   requestAnimationFrame(loop);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   processCharFrame();
-  if(isVideoPlaying){
-    drawCharacter(characters[0]);
+  if (isVideoPlaying) {
+    updateGroundDetection(ts);
+    drawScanIndicator(ts);
+    if (groundFound) {
+      ctx.save();
+      ctx.globalAlpha = groundOpacity;
+      drawCharacter(characters[0]);
+      ctx.restore();
+    }
   }
 }
 
