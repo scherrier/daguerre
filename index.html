@@ -227,26 +227,26 @@
   <button id="createBtn" class="ar-cta-button" style="display:none">
     Créer un daguerréotype
   </button>
+
+  <!-- Processing state — inside the DOM overlay root so the XR compositor shows it -->
+  <div id="loading-overlay">
+    <p id="loading-text">Création du daguerréotype...</p>
+  </div>
+
+  <!-- Result screen — inside the DOM overlay root for the same reason -->
+  <div id="result-overlay">
+    <img id="result-img" alt="" />
+    <div id="result-actions">
+      <button id="saveBtn" class="ar-cta-button">Enregistrer l'image</button>
+      <button id="resumeBtn">Reprendre</button>
+    </div>
+  </div>
 </div>
 
 <!-- Landing screen -->
 <div id="start-overlay">
   <button id="startBtn" class="ar-cta-button">Rencontrer Louis Daguerre</button>
   <div id="errMsg"></div>
-</div>
-
-<!-- Processing state -->
-<div id="loading-overlay">
-  <p id="loading-text">Création du daguerréotype...</p>
-</div>
-
-<!-- Result screen — covers everything once processing is done -->
-<div id="result-overlay">
-  <img id="result-img" alt="" />
-  <div id="result-actions">
-    <button id="saveBtn" class="ar-cta-button">Enregistrer l'image</button>
-    <button id="resumeBtn">Reprendre</button>
-  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
