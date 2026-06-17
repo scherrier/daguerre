@@ -389,16 +389,9 @@ let captureNextFrame  = false;
 let processingCapture = false;
 let savedDataURL      = null;
 
-// Parallel getUserMedia stream used as a capturable camera background.
-// WebXR composites the live feed at the OS level (not in the WebGL framebuffer),
-// so toDataURL / readRenderTargetPixels never see it; this stream gives us a
-// real video frame to draw behind Daguerre when the daguerreotype is captured.
-let bgStream  = null;
-const bgVideo = Object.assign(document.createElement('video'), {
-  autoplay: true, muted: true, playsInline: true,
-});
-bgVideo.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
-document.body.appendChild(bgVideo);
+// XRWebGLBinding gives access to the same camera texture WebXR composites.
+// Created once the XR session starts; null when no session is active.
+let xrBinding = null;
 
 createBtn.addEventListener('click', () => {
   if (processingCapture) return;
@@ -531,29 +524,6 @@ function showError(msg) {
   errMsg.style.display = 'block';
 }
 
-// ─── Background camera stream ────────────────────────────────────────────────
-
-async function startCameraBackground() {
-  try {
-    bgStream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false,
-    });
-    bgVideo.srcObject = bgStream;
-    await bgVideo.play().catch(() => {});
-  } catch {
-    bgStream = null; // XR may hold exclusive camera access; capture degrades gracefully
-  }
-}
-
-function stopCameraBackground() {
-  if (bgStream) {
-    bgStream.getTracks().forEach(t => t.stop());
-    bgStream = null;
-    bgVideo.srcObject = null;
-  }
-}
-
 // ─── WebXR session ────────────────────────────────────────────────────────────
 
 let hitTestSource          = null;
@@ -575,15 +545,20 @@ async function startAR() {
   try {
     const session = await navigator.xr.requestSession('immersive-ar', {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay'],
+      optionalFeatures: ['dom-overlay', 'camera-access'],
       domOverlay: { root: arUI },
     });
 
     renderer.xr.setReferenceSpaceType('local');
-    await renderer.xr.setSession(session);
-    renderer.setAnimationLoop(onXRFrame);
+    await renderer.xr.setSession(session); // makes the GL context XR-compatible
 
-    startCameraBackground(); // fire-and-forget; fails silently if camera is exclusive
+    // XRWebGLBinding uses the same GL context Three.js uses for XR, giving us
+    // getCameraImage() — the exact texture the compositor is showing.
+    if (session.enabledFeatures?.includes('camera-access')) {
+      xrBinding = new XRWebGLBinding(session, renderer.getContext());
+    }
+
+    renderer.setAnimationLoop(onXRFrame);
 
     startOverlay.style.display = 'none';
     arUI.style.display         = 'flex';
@@ -595,7 +570,7 @@ async function startAR() {
 }
 
 function onSessionEnd() {
-  stopCameraBackground();
+  xrBinding = null;
   if (daguerreMesh) scene.remove(daguerreMesh);
   daguerreMesh           = null;
   daguerrePlaced         = false;
@@ -624,15 +599,18 @@ function onSessionEnd() {
 }
 
 // ─── Capture helper ───────────────────────────────────────────────────────────
-// The XR swap-chain framebuffer is cleared after every present — toDataURL()
-// on renderer.domElement always reads blank. Re-render Daguerre into a plain
-// WebGLRenderTarget (which XR never touches), read the pixels back, then
-// composite the live bgVideo camera frame as the background behind him.
-function renderSceneToDataURL() {
-  const w = renderer.domElement.width;
-  const h = renderer.domElement.height;
+// The XR swap-chain framebuffer is cleared after every present so toDataURL()
+// on renderer.domElement always reads blank. Instead:
+//   1. Re-render Daguerre into a plain WebGLRenderTarget and read its pixels.
+//   2. Read the XR camera texture (same texture the compositor shows) into a
+//      second pixel buffer via a temporary WebGL framebuffer.
+//   3. Composite camera -> Daguerre on a 2D canvas and return a data URL.
+function renderSceneToDataURL(camTexInfo) {
+  const w  = renderer.domElement.width;
+  const h  = renderer.domElement.height;
+  const gl = renderer.getContext();
 
-  // Re-render Daguerre into an off-screen WebGL framebuffer.
+  // 1. Render Daguerre into an off-screen target.
   const target = new THREE.WebGLRenderTarget(w, h, {
     format: THREE.RGBAFormat,
     type:   THREE.UnsignedByteType,
@@ -642,41 +620,66 @@ function renderSceneToDataURL() {
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
 
-  const pixels = new Uint8Array(w * h * 4);
-  renderer.readRenderTargetPixels(target, 0, 0, w, h, pixels);
+  const dagPixels = new Uint8Array(w * h * 4);
+  renderer.readRenderTargetPixels(target, 0, 0, w, h, dagPixels);
   target.dispose();
 
-  // Composite: camera background -> Daguerre (chroma-keyed alpha on top).
+  // 2. Read the XR camera texture via a temporary framebuffer.
+  let camCanvas = null;
+  if (camTexInfo?.texture) {
+    const { texture, width: cw, height: ch } = camTexInfo;
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+      const camPixels = new Uint8Array(cw * ch * 4);
+      gl.readPixels(0, 0, cw, ch, gl.RGBA, gl.UNSIGNED_BYTE, camPixels);
+
+      camCanvas = document.createElement('canvas');
+      camCanvas.width  = cw;
+      camCanvas.height = ch;
+      const camCtx  = camCanvas.getContext('2d');
+      const camData = camCtx.createImageData(cw, ch);
+      for (let row = 0; row < ch; row++) {  // Y-flip: WebGL origin is bottom-left
+        camData.data.set(
+          camPixels.subarray((ch - 1 - row) * cw * 4, (ch - row) * cw * 4),
+          row * cw * 4
+        );
+      }
+      camCtx.putImageData(camData, 0, 0);
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fbo);
+  }
+
+  // 3. Composite: camera background then Daguerre on top.
   const scratch = document.createElement('canvas');
   scratch.width  = w;
   scratch.height = h;
   const ctx = scratch.getContext('2d');
 
-  // 1. Camera frame as background (if the parallel getUserMedia stream is ready).
-  if (bgStream && bgVideo.readyState >= 2 && bgVideo.videoWidth > 0) {
-    const vw    = bgVideo.videoWidth;
-    const vh    = bgVideo.videoHeight;
-    const scale = Math.max(w / vw, h / vh); // object-fit: cover
-    const dw    = vw * scale;
-    const dh    = vh * scale;
-    ctx.drawImage(bgVideo, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  if (camCanvas) {
+    const scale = Math.max(w / camCanvas.width, h / camCanvas.height); // cover
+    const dw    = camCanvas.width  * scale;
+    const dh    = camCanvas.height * scale;
+    ctx.drawImage(camCanvas, (w - dw) / 2, (h - dh) / 2, dw, dh);
   }
 
-  // 2. Flip WebGL Y-axis and draw Daguerre over the camera frame.
-  //    drawImage uses source-over compositing, so the chroma-keyed alpha lets
-  //    the camera background show through wherever Daguerre is transparent.
+  // Y-flip Daguerre pixels; source-over compositing respects chroma-key alpha.
   const daguCanvas = document.createElement('canvas');
   daguCanvas.width  = w;
   daguCanvas.height = h;
   const daguCtx = daguCanvas.getContext('2d');
-  const imgData = daguCtx.createImageData(w, h);
+  const dagData = daguCtx.createImageData(w, h);
   for (let row = 0; row < h; row++) {
-    imgData.data.set(
-      pixels.subarray((h - 1 - row) * w * 4, (h - row) * w * 4),
+    dagData.data.set(
+      dagPixels.subarray((h - 1 - row) * w * 4, (h - row) * w * 4),
       row * w * 4
     );
   }
-  daguCtx.putImageData(imgData, 0, 0);
+  daguCtx.putImageData(dagData, 0, 0);
   ctx.drawImage(daguCanvas, 0, 0);
 
   return scratch.toDataURL('image/png');
@@ -724,9 +727,25 @@ function onXRFrame(timestamp, frame) {
 
   if (captureNextFrame) {
     captureNextFrame = false;
-    // Re-render into an off-screen WebGLRenderTarget (XR swap-chain is unreadable)
-    const dataURL = renderSceneToDataURL();
-    // Yield to let the loading overlay paint before the pixel-processing loop runs
+
+    // Grab the XR camera image for this exact frame while we're still inside
+    // the frame callback (the texture is only valid within the same frame).
+    let camTexInfo = null;
+    if (xrBinding) {
+      const viewerPose = frame.getViewerPose(refSpace);
+      if (viewerPose) {
+        const view = viewerPose.views[0]; // single view in handheld AR
+        if (view?.camera) {
+          camTexInfo = {
+            texture: xrBinding.getCameraImage(view.camera),
+            width:   view.camera.width,
+            height:  view.camera.height,
+          };
+        }
+      }
+    }
+
+    const dataURL = renderSceneToDataURL(camTexInfo);
     setTimeout(() => processDaguerreotype(dataURL), 30);
   }
 }
