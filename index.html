@@ -257,8 +257,7 @@
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-// preserveDrawingBuffer lets us call toDataURL() after each XR frame render
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
@@ -587,6 +586,46 @@ function onSessionEnd() {
   createBtn.disabled       = false;
 }
 
+// ─── Capture helper ───────────────────────────────────────────────────────────
+// In WebXR the XR compositor manages its own swap-chain framebuffer and clears
+// it after every present — toDataURL() on renderer.domElement always reads
+// blank. Re-render into a plain WebGLRenderTarget that XR never touches, then
+// read the pixels back through readRenderTargetPixels.
+function renderSceneToDataURL() {
+  const w = renderer.domElement.width;
+  const h = renderer.domElement.height;
+
+  const target = new THREE.WebGLRenderTarget(w, h, {
+    format: THREE.RGBAFormat,
+    type:   THREE.UnsignedByteType,
+    depthBuffer: false,
+  });
+
+  renderer.setRenderTarget(target);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+
+  const pixels = new Uint8Array(w * h * 4);
+  renderer.readRenderTargetPixels(target, 0, 0, w, h, pixels);
+  target.dispose();
+
+  // WebGL origin is bottom-left; 2D canvas is top-left — flip Y.
+  const scratch = document.createElement('canvas');
+  scratch.width  = w;
+  scratch.height = h;
+  const ctx = scratch.getContext('2d');
+  const imgData = ctx.createImageData(w, h);
+  for (let row = 0; row < h; row++) {
+    imgData.data.set(
+      pixels.subarray((h - 1 - row) * w * 4, (h - row) * w * 4),
+      row * w * 4
+    );
+  }
+  ctx.putImageData(imgData, 0, 0);
+
+  return scratch.toDataURL('image/png');
+}
+
 // ─── XR frame loop ────────────────────────────────────────────────────────────
 
 function onXRFrame(timestamp, frame) {
@@ -627,10 +666,10 @@ function onXRFrame(timestamp, frame) {
 
   renderer.render(scene, camera);
 
-  // Capture the composited frame immediately after render, while the buffer is live
   if (captureNextFrame) {
     captureNextFrame = false;
-    const dataURL = renderer.domElement.toDataURL('image/png');
+    // Re-render into an off-screen WebGLRenderTarget (XR swap-chain is unreadable)
+    const dataURL = renderSceneToDataURL();
     // Yield to let the loading overlay paint before the pixel-processing loop runs
     setTimeout(() => processDaguerreotype(dataURL), 30);
   }
