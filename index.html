@@ -435,48 +435,129 @@ async function processDaguerreotype(dataURL) {
   const w = offscreen.width;
   const h = offscreen.height;
 
-  // Dark silver-plate background fills any transparent areas
+  // Dark silver-plate background fills any transparent areas from the AR layer.
   c.fillStyle = '#080a10';
   c.fillRect(0, 0, w, h);
   c.drawImage(img, 0, 0);
 
-  // ── Pixel pass: grayscale → contrast → grain → silver-blue tint ─────────
-  const imgData = c.getImageData(0, 0, w, h);
-  const d = imgData.data;
+  // ── Precompute S-curve lookup table (integer 0-255 → float 0-1) ──────────
+  // Using a sigmoid so shadows and highlights are treated symmetrically.
+  // Lifted blacks (min ≈ 0.05) keep shadows deep but not crushed.
+  const lut = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let x = i / 255;
+    x = 1 / (1 + Math.exp(-6 * (x - 0.5))); // sigmoid S-curve
+    x = x * 0.92 + 0.04;                     // lift blacks, compress highlights
+    x = Math.pow(x, 0.92);                   // gentle gamma lift in midtones
+    lut[i] = x;
+  }
 
-  for (let i = 0; i < d.length; i += 4) {
-    // Luminance grayscale
-    let lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  // ── Pass 1: extract grayscale luminance for all downstream operations ─────
+  const raw  = c.getImageData(0, 0, w, h);
+  const d    = raw.data;
+  const gray = new Uint8Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
+  }
 
-    // Contrast (pivoted at 128 to keep midtones)
-    lum = (lum - 128) * 1.18 + 128;
+  // ── Build a blurred copy of the grayscale image (local contrast base) ─────
+  // We draw the gray image to an offscreen canvas, apply a CSS blur filter,
+  // then read it back. The high-pass (original − blurred) is the local detail
+  // signal; adding it back after tone-mapping sharpens flat areas uniformly.
+  const grayCanvas = document.createElement('canvas');
+  grayCanvas.width  = w;
+  grayCanvas.height = h;
+  const grayCtx  = grayCanvas.getContext('2d');
+  const grayImgD = grayCtx.createImageData(w, h);
+  for (let p = 0; p < gray.length; p++) {
+    const v = gray[p];
+    grayImgD.data[p * 4]     = v;
+    grayImgD.data[p * 4 + 1] = v;
+    grayImgD.data[p * 4 + 2] = v;
+    grayImgD.data[p * 4 + 3] = 255;
+  }
+  grayCtx.putImageData(grayImgD, 0, 0);
 
-    // Fine grain (±7 noise per spec)
-    lum += (Math.random() - 0.5) * 14;
-    lum  = Math.max(0, Math.min(255, lum));
+  const blurCanvas = document.createElement('canvas');
+  blurCanvas.width  = w;
+  blurCanvas.height = h;
+  const blurCtx = blurCanvas.getContext('2d');
+  blurCtx.filter = 'blur(12px)';
+  blurCtx.drawImage(grayCanvas, 0, 0);
+  const blurData = blurCtx.getImageData(0, 0, w, h).data;
 
-    // Silver-blue tint
-    d[i]     = Math.min(255, lum * 0.92 | 0); // r — slightly cooler
-    d[i + 1] = Math.min(255, lum * 0.96 | 0); // g
-    d[i + 2] = Math.min(255, lum * 1.05 | 0); // b — blue-silver cast
+  // ── Build bloom mask: bright pixels only, then blur for soft glow ─────────
+  const BLOOM_THRESH = 0.72;
+  const bloomSrc = document.createElement('canvas');
+  bloomSrc.width  = w;
+  bloomSrc.height = h;
+  const bloomSrcCtx  = bloomSrc.getContext('2d');
+  const bloomSrcImgD = bloomSrcCtx.createImageData(w, h);
+  for (let p = 0; p < gray.length; p++) {
+    const v    = gray[p] / 255;
+    const mask = v > BLOOM_THRESH ? ((v - BLOOM_THRESH) / (1 - BLOOM_THRESH)) * 255 : 0;
+    const m    = mask | 0;
+    bloomSrcImgD.data[p * 4]     = m;
+    bloomSrcImgD.data[p * 4 + 1] = m;
+    bloomSrcImgD.data[p * 4 + 2] = m;
+    bloomSrcImgD.data[p * 4 + 3] = 255;
+  }
+  bloomSrcCtx.putImageData(bloomSrcImgD, 0, 0);
+
+  const bloomBlur = document.createElement('canvas');
+  bloomBlur.width  = w;
+  bloomBlur.height = h;
+  const bloomBlurCtx = bloomBlur.getContext('2d');
+  bloomBlurCtx.filter = 'blur(22px)';
+  bloomBlurCtx.drawImage(bloomSrc, 0, 0);
+
+  // ── Pass 2: S-curve + local contrast + grain + silver-blue tint ──────────
+  // All operations run on the already-composited image (camera + Daguerre
+  // together), so every part of the frame receives identical treatment.
+  const LOCAL_CONTRAST = 0.18;
+  const GRAIN_AMOUNT   = 8;
+
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    // Tone-mapped luminance from LUT (S-curve + lifted blacks + gamma)
+    let lum = lut[gray[p]];
+
+    // Local contrast: add back the high-pass detail to sharpen flat areas
+    lum += ((gray[p] - blurData[p * 4]) / 255) * LOCAL_CONTRAST;
+    lum  = Math.max(0, Math.min(1, lum));
+
+    // Monochrome grain applied globally so both character and background match
+    lum += (Math.random() - 0.5) * GRAIN_AMOUNT / 255;
+    lum  = Math.max(0, Math.min(1, lum));
+
+    const v  = lum * 255;
+    d[i]     = Math.min(255, v * 0.90 | 0); // silver tint — red slightly cool
+    d[i + 1] = Math.min(255, v * 0.95 | 0); //              green neutral
+    d[i + 2] = Math.min(255, v * 1.06 | 0); //              blue cast
     d[i + 3] = 255;
   }
-  c.putImageData(imgData, 0, 0);
+  c.putImageData(raw, 0, 0);
+
+  // ── Highlight bloom: screen-blend the blurred bright mask ────────────────
+  c.globalCompositeOperation = 'screen';
+  c.globalAlpha = 0.10;
+  c.drawImage(bloomBlur, 0, 0);
+  c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = 1;
 
   // ── Vignette ──────────────────────────────────────────────────────────────
   const cx   = w / 2;
   const cy   = h / 2;
   const maxR = Math.sqrt(cx * cx + cy * cy);
-  const vig  = c.createRadialGradient(cx, cy, maxR * 0.28, cx, cy, maxR);
+  const vig  = c.createRadialGradient(cx, cy, maxR * 0.25, cx, cy, maxR);
   vig.addColorStop(0,    'rgba(0,0,0,0)');
-  vig.addColorStop(0.65, 'rgba(0,0,0,0.08)');
-  vig.addColorStop(1,    'rgba(0,0,0,0.45)');
+  vig.addColorStop(0.60, 'rgba(0,0,0,0.10)');
+  vig.addColorStop(1,    'rgba(0,0,0,0.55)');
   c.fillStyle = vig;
   c.fillRect(0, 0, w, h);
 
   // ── Centre highlight glow ─────────────────────────────────────────────────
   const glow = c.createRadialGradient(cx, cy * 0.9, 0, cx, cy, maxR * 0.8);
-  glow.addColorStop(0, 'rgba(210,225,255,0.06)');
+  glow.addColorStop(0, 'rgba(210,225,255,0.05)');
   glow.addColorStop(1, 'rgba(0,0,0,0)');
   c.fillStyle = glow;
   c.fillRect(0, 0, w, h);
@@ -484,7 +565,6 @@ async function processDaguerreotype(dataURL) {
   // ── Plate imperfections ───────────────────────────────────────────────────
   c.save();
 
-  // Subtle vertical scratches
   const nScratch = 4 + (Math.random() * 5 | 0);
   for (let s = 0; s < nScratch; s++) {
     const sx  = Math.random() * w;
@@ -498,12 +578,11 @@ async function processDaguerreotype(dataURL) {
       sx + off() * 5, sy + (ey - sy) * 0.66,
       sx + off() * 8, ey
     );
-    c.strokeStyle = `rgba(255,255,255,${(0.05 + Math.random() * 0.04).toFixed(3)})`;
+    c.strokeStyle = `rgba(255,255,255,${(0.04 + Math.random() * 0.04).toFixed(3)})`;
     c.lineWidth   = 0.4 + Math.random() * 0.7;
     c.stroke();
   }
 
-  // Dust marks
   const nDust = 10 + (Math.random() * 12 | 0);
   for (let k = 0; k < nDust; k++) {
     c.beginPath();
@@ -511,6 +590,7 @@ async function processDaguerreotype(dataURL) {
     c.fillStyle = `rgba(0,0,0,${(0.04 + Math.random() * 0.04).toFixed(3)})`;
     c.fill();
   }
+
   c.restore();
 
   savedDataURL = offscreen.toDataURL('image/png');
