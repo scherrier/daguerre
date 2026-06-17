@@ -176,6 +176,7 @@ async function startCamera(mode) {
   } catch (e) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      isVideoPlaying = true;
       video.srcObject = stream;
       overlay.style.display = 'none';
     } catch (err) {
@@ -217,8 +218,8 @@ function angleDelta(a, b) {
 }
 
 function handleOrientation(e) {
-  orientationAvailable = true;
   if (e.alpha === null || e.beta === null) return;
+  orientationAvailable = true; // only mark available once we have real sensor data
   currentBeta        = e.beta;
   currentOrientation = { alpha: e.alpha, beta: e.beta };
   if (!placedOrientation) return; // anchor set only when ground is found
@@ -302,19 +303,28 @@ function drawScanIndicator(ts) {
   ctx.save();
   ctx.globalAlpha = scanOpacity;
 
-  // Dashed oval representing the ground plane
-  ctx.beginPath();
-  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  // Build an oval path via scale+arc — avoids ctx.ellipse which is absent on
+  // some older mobile WebViews. Canvas path points are stored in device coords,
+  // so the transform can be restored before stroking without losing the shape.
+  function ovalPath(startAngle, endAngle) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(rx, ry);
+    ctx.beginPath();
+    ctx.arc(0, 0, 1, startAngle, endAngle);
+    ctx.restore();
+  }
+
+  // Dashed oval outline
+  ovalPath(0, Math.PI * 2);
   ctx.strokeStyle = 'rgba(255,255,255,0.3)';
   ctx.lineWidth   = 2;
   ctx.setLineDash([8, 6]);
   ctx.stroke();
 
-  // Filled arc showing detection progress
+  // Progress arc
   if (progress > 0) {
-    ctx.beginPath();
-    ctx.ellipse(cx, cy, rx, ry, -Math.PI / 2, -Math.PI / 2,
-                -Math.PI / 2 + Math.PI * 2 * progress);
+    ovalPath(-Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
     ctx.strokeStyle = 'rgba(80, 210, 255, 0.9)';
     ctx.lineWidth   = 3;
     ctx.setLineDash([]);
@@ -323,25 +333,24 @@ function drawScanIndicator(ts) {
 
   // Orbiting dots
   const t = (ts / 900) % 1;
+  ctx.setLineDash([]);
   for (let i = 0; i < 6; i++) {
     const angle = (i / 6) * Math.PI * 2 + t * Math.PI * 2;
     const alpha = 0.35 + 0.65 * ((i / 6 + t) % 1);
     ctx.beginPath();
     ctx.arc(cx + Math.cos(angle) * rx, cy + Math.sin(angle) * ry, 3, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(80, 210, 255, ${alpha})`;
-    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(80,210,255,' + alpha.toFixed(2) + ')';
     ctx.fill();
   }
 
   // Status label
   const fontSize = Math.max(13, Math.round(canvas.width * 0.033));
-  ctx.font      = `${fontSize}px Arial`;
+  ctx.font      = fontSize + 'px Arial';
   ctx.textAlign = 'center';
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.setLineDash([]);
   ctx.fillText(
-    groundFound ? 'Ground found!'              :
-    looking     ? 'Detecting ground surface…'  :
+    groundFound ? 'Ground found!'               :
+    looking     ? 'Detecting ground surface...' :
                   'Point camera at the ground',
     cx, cy + ry + fontSize + 6
   );
