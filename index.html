@@ -32,7 +32,7 @@
       align-items: center;
       justify-content: flex-end;
       padding-bottom: calc(32px + env(safe-area-inset-bottom));
-      pointer-events: none;   /* pass-through; buttons below opt back in */
+      pointer-events: none;
     }
 
     #scan-hint {
@@ -43,6 +43,30 @@
       text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
       text-align: center;
       padding: 0 24px;
+    }
+
+    /* Helper text shown after video ends */
+    .daguerre-helper-text {
+      position: fixed;
+      left: 50%;
+      bottom: calc(96px + env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      z-index: 19;
+      max-width: calc(100vw - 40px);
+      padding: 10px 14px;
+      font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1.35;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.96);
+      background: rgba(8, 18, 32, 0.58);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 14px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22);
+      pointer-events: none;
     }
 
     /* ── Landing screen ──────────────────────────────────────────────── */
@@ -64,7 +88,6 @@
       min-width: 280px;
       max-width: calc(100vw - 32px);
       padding: 16px 24px;
-
       font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
       font-size: 17px;
       font-weight: 600;
@@ -72,7 +95,6 @@
       letter-spacing: 0.015em;
       text-align: center;
       white-space: nowrap;
-
       color: #ffffff;
       background: linear-gradient(135deg, #165dff 0%, #00b8d9 100%);
       border: 1px solid rgba(255, 255, 255, 0.36);
@@ -120,25 +142,111 @@
       max-width: 300px;
       padding: 0 16px;
     }
+
+    /* ── Loading overlay ─────────────────────────────────────────────── */
+    #loading-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.62);
+      z-index: 45;
+    }
+
+    #loading-text {
+      color: rgba(255, 255, 255, 0.9);
+      font-family: "Inter", system-ui, sans-serif;
+      font-size: 16px;
+      font-weight: 500;
+      text-align: center;
+      letter-spacing: 0.01em;
+    }
+
+    /* ── Result overlay ──────────────────────────────────────────────── */
+    #result-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      background: #000;
+      z-index: 50;
+    }
+
+    #result-img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    #result-actions {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding-bottom: calc(32px + env(safe-area-inset-bottom));
+      width: 100%;
+    }
+
+    #resumeBtn {
+      color: rgba(255, 255, 255, 0.75);
+      font-family: "Inter", system-ui, sans-serif;
+      font-size: 15px;
+      font-weight: 500;
+      background: none;
+      border: none;
+      cursor: pointer;
+      pointer-events: auto;
+      padding: 8px 20px;
+      -webkit-tap-highlight-color: transparent;
+    }
   </style>
 </head>
 <body>
 
-<!-- Character video — hidden, started only after placement -->
+<!-- Character video — no loop; plays once, holds the last frame -->
 <video id="charVideo" src="daguerre.mp4" muted playsinline
   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
 
 <!-- DOM overlay shown during the AR session -->
 <div id="ar-ui">
+  <!-- Phase 1: scanning + placement -->
   <p id="scan-hint">Pointez vers le sol</p>
   <button id="placeBtn" class="ar-cta-button" disabled>Placer Louis Daguerre ici</button>
-  <button id="takePhotoBtn" class="ar-cta-button" disabled>Prendre une photo avec Daguerre</button>
+
+  <!-- Phase 2: after video ends — helper text uses its own fixed position -->
+  <p id="helperText" class="daguerre-helper-text" style="display:none">
+    Ajoutez une personne à la scène ou capturez simplement Louis Daguerre.
+  </p>
+  <button id="createBtn" class="ar-cta-button" style="display:none">
+    Créer un daguerréotype
+  </button>
 </div>
 
 <!-- Landing screen -->
 <div id="start-overlay">
   <button id="startBtn" class="ar-cta-button">Rencontrer Louis Daguerre</button>
   <div id="errMsg"></div>
+</div>
+
+<!-- Processing state -->
+<div id="loading-overlay">
+  <p id="loading-text">Création du daguerréotype...</p>
+</div>
+
+<!-- Result screen — covers everything once processing is done -->
+<div id="result-overlay">
+  <img id="result-img" alt="" />
+  <div id="result-actions">
+    <button id="saveBtn" class="ar-cta-button">Enregistrer l'image</button>
+    <button id="resumeBtn">Reprendre</button>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
@@ -149,7 +257,8 @@
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+// preserveDrawingBuffer lets us call toDataURL() after each XR frame render
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
@@ -161,26 +270,25 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ─── Reticle (hit-test indicator on the detected ground) ─────────────────────
+// ─── Reticle ─────────────────────────────────────────────────────────────────
 
 const reticle = new THREE.Mesh(
   new THREE.RingGeometry(0.10, 0.13, 32).rotateX(-Math.PI / 2),
   new THREE.MeshBasicMaterial({ color: 0x50d2ff, side: THREE.DoubleSide })
 );
-reticle.matrixAutoUpdate = false; // matrix set from hit-test each frame
+reticle.matrixAutoUpdate = false;
 reticle.visible = false;
 scene.add(reticle);
 
 // ─── Daguerre character ───────────────────────────────────────────────────────
 
 const charVideo = document.getElementById('charVideo');
-const DAGUERRE_HEIGHT = 1.72; // metres — calibrated to real-world standing height
+const DAGUERRE_HEIGHT = 1.72; // metres
 
 const videoTex = new THREE.VideoTexture(charVideo);
 videoTex.minFilter = THREE.LinearFilter;
 videoTex.magFilter = THREE.LinearFilter;
 
-// Chroma-key shader — same algorithm as before, now as a Three.js material
 const daguerreMat = new THREE.ShaderMaterial({
   uniforms: { uTex: { value: videoTex } },
   vertexShader: `
@@ -212,18 +320,24 @@ let daguerrePlaced = false;
 
 function buildDaguerreMesh() {
   if (daguerreMesh) return;
-  const vw     = charVideo.videoWidth  || 9;  // fallback 9:16 if metadata not yet ready
+  const vw     = charVideo.videoWidth  || 9;
   const vh     = charVideo.videoHeight || 16;
   const planeW = DAGUERRE_HEIGHT * (vw / vh);
   daguerreMesh = new THREE.Mesh(
     new THREE.PlaneGeometry(planeW, DAGUERRE_HEIGHT),
     daguerreMat
   );
-  daguerreMesh.matrixAutoUpdate = false; // position written once at placement, never again
+  daguerreMesh.matrixAutoUpdate = false;
 }
 
 charVideo.addEventListener('loadedmetadata', buildDaguerreMesh);
 if (charVideo.readyState >= 1) buildDaguerreMesh();
+
+// When the video ends: hold the last frame, reveal the daguerreotype CTA
+charVideo.addEventListener('ended', () => {
+  helperText.style.display = 'block';
+  createBtn.style.display  = 'block';
+});
 
 // ─── Placement ────────────────────────────────────────────────────────────────
 
@@ -233,21 +347,15 @@ function placeDaguerre() {
 
   buildDaguerreMesh();
 
-  // Ground position from the reticle (which mirrors the current hit-test result)
   const hitPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+  const cam    = camera.position;
+  const theta  = Math.atan2(cam.x - hitPos.x, cam.z - hitPos.z);
 
-  // Compute Y-only rotation so Daguerre faces the camera at placement time,
-  // then freeze that rotation — never updated again.
-  const cam   = camera.position;
-  const theta = Math.atan2(cam.x - hitPos.x, cam.z - hitPos.z);
-
-  // Set world matrix: rotate around Y to face camera, shift centre up by half height.
-  // matrixAutoUpdate = false means Three.js will never overwrite this matrix.
   daguerreMesh.matrix
     .makeRotationY(theta)
     .setPosition(hitPos.x, hitPos.y + DAGUERRE_HEIGHT / 2, hitPos.z);
 
-  scene.add(daguerreMesh); // added to scene, NOT to camera — stays fixed in world space
+  scene.add(daguerreMesh);
 
   reticle.visible        = false;
   placeBtn.style.display = 'none';
@@ -256,39 +364,157 @@ function placeDaguerre() {
   charVideo.play().catch(() => {});
 }
 
-// Display take photo with Daguerre button when Daguerre video ends
-charVideo.addEventListener('ended', () => {
-  takePhotoBtn.style.display = 'block';
-  takePhotoBtn.disabled = false;
-});
+// ─── UI references ────────────────────────────────────────────────────────────
 
-// ─── UI ───────────────────────────────────────────────────────────────────────
-
-const startOverlay = document.getElementById('start-overlay');
-const arUI         = document.getElementById('ar-ui');
-const scanHint     = document.getElementById('scan-hint');
-const placeBtn     = document.getElementById('placeBtn');
-const takePhotoBtn = document.getElementById('takePhotoBtn');
-const errMsg       = document.getElementById('errMsg');
+const startOverlay   = document.getElementById('start-overlay');
+const arUI           = document.getElementById('ar-ui');
+const scanHint       = document.getElementById('scan-hint');
+const placeBtn       = document.getElementById('placeBtn');
+const helperText     = document.getElementById('helperText');
+const createBtn      = document.getElementById('createBtn');
+const errMsg         = document.getElementById('errMsg');
+const loadingOverlay = document.getElementById('loading-overlay');
+const resultOverlay  = document.getElementById('result-overlay');
+const resultImg      = document.getElementById('result-img');
+const saveBtn        = document.getElementById('saveBtn');
+const resumeBtn      = document.getElementById('resumeBtn');
 
 placeBtn.addEventListener('click', () => {
-  charVideo.play().catch(() => {}); // unlock video in user-gesture context before placement
+  charVideo.play().catch(() => {});
   placeDaguerre();
 });
 
-takePhotoBtn.addEventListener('click', () => {
-  // Capture a screenshot of the current canvas
-  renderer.domElement.toBlob(blob => {
-    const url = URL.createObjectURL(blob);
-    const a   = document.createElement('a');
-    a.href    = url;
-    a.download = 'daguerre.png';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  });
+// ─── Capture + daguerreotype filter ──────────────────────────────────────────
+
+let captureNextFrame  = false;
+let processingCapture = false;
+let savedDataURL      = null;
+
+createBtn.addEventListener('click', () => {
+  if (processingCapture) return;
+  processingCapture       = true;
+  createBtn.disabled      = true;
+  loadingOverlay.style.display = 'flex';
+  captureNextFrame = true;
 });
+
+saveBtn.addEventListener('click', () => {
+  if (!savedDataURL) return;
+  const a      = document.createElement('a');
+  a.href       = savedDataURL;
+  a.download   = 'daguerreotype.png';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+
+resumeBtn.addEventListener('click', () => {
+  resultOverlay.style.display = 'none';
+  createBtn.disabled          = false;
+  processingCapture           = false;
+});
+
+function loadImage(src) {
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.src = src;
+  });
+}
+
+async function processDaguerreotype(dataURL) {
+  const img = await loadImage(dataURL);
+
+  const offscreen = document.createElement('canvas');
+  offscreen.width  = img.width;
+  offscreen.height = img.height;
+  const c = offscreen.getContext('2d');
+  const w = offscreen.width;
+  const h = offscreen.height;
+
+  // Dark silver-plate background fills any transparent areas
+  c.fillStyle = '#080a10';
+  c.fillRect(0, 0, w, h);
+  c.drawImage(img, 0, 0);
+
+  // ── Pixel pass: grayscale → contrast → grain → silver-blue tint ─────────
+  const imgData = c.getImageData(0, 0, w, h);
+  const d = imgData.data;
+
+  for (let i = 0; i < d.length; i += 4) {
+    // Luminance grayscale
+    let lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+
+    // Contrast (pivoted at 128 to keep midtones)
+    lum = (lum - 128) * 1.18 + 128;
+
+    // Fine grain (±7 noise per spec)
+    lum += (Math.random() - 0.5) * 14;
+    lum  = Math.max(0, Math.min(255, lum));
+
+    // Silver-blue tint
+    d[i]     = Math.min(255, lum * 0.92 | 0); // r — slightly cooler
+    d[i + 1] = Math.min(255, lum * 0.96 | 0); // g
+    d[i + 2] = Math.min(255, lum * 1.05 | 0); // b — blue-silver cast
+    d[i + 3] = 255;
+  }
+  c.putImageData(imgData, 0, 0);
+
+  // ── Vignette ──────────────────────────────────────────────────────────────
+  const cx   = w / 2;
+  const cy   = h / 2;
+  const maxR = Math.sqrt(cx * cx + cy * cy);
+  const vig  = c.createRadialGradient(cx, cy, maxR * 0.28, cx, cy, maxR);
+  vig.addColorStop(0,    'rgba(0,0,0,0)');
+  vig.addColorStop(0.65, 'rgba(0,0,0,0.08)');
+  vig.addColorStop(1,    'rgba(0,0,0,0.45)');
+  c.fillStyle = vig;
+  c.fillRect(0, 0, w, h);
+
+  // ── Centre highlight glow ─────────────────────────────────────────────────
+  const glow = c.createRadialGradient(cx, cy * 0.9, 0, cx, cy, maxR * 0.8);
+  glow.addColorStop(0, 'rgba(210,225,255,0.06)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  c.fillStyle = glow;
+  c.fillRect(0, 0, w, h);
+
+  // ── Plate imperfections ───────────────────────────────────────────────────
+  c.save();
+
+  // Subtle vertical scratches
+  const nScratch = 4 + (Math.random() * 5 | 0);
+  for (let s = 0; s < nScratch; s++) {
+    const sx  = Math.random() * w;
+    const sy  = Math.random() * h * 0.5;
+    const ey  = sy + h * (0.15 + Math.random() * 0.55);
+    const off = () => (Math.random() - 0.5);
+    c.beginPath();
+    c.moveTo(sx, sy);
+    c.bezierCurveTo(
+      sx + off() * 5, sy + (ey - sy) * 0.33,
+      sx + off() * 5, sy + (ey - sy) * 0.66,
+      sx + off() * 8, ey
+    );
+    c.strokeStyle = `rgba(255,255,255,${(0.05 + Math.random() * 0.04).toFixed(3)})`;
+    c.lineWidth   = 0.4 + Math.random() * 0.7;
+    c.stroke();
+  }
+
+  // Dust marks
+  const nDust = 10 + (Math.random() * 12 | 0);
+  for (let k = 0; k < nDust; k++) {
+    c.beginPath();
+    c.arc(Math.random() * w, Math.random() * h, 0.5 + Math.random() * 2.5, 0, Math.PI * 2);
+    c.fillStyle = `rgba(0,0,0,${(0.04 + Math.random() * 0.04).toFixed(3)})`;
+    c.fill();
+  }
+  c.restore();
+
+  savedDataURL = offscreen.toDataURL('image/png');
+  loadingOverlay.style.display = 'none';
+  resultImg.src = savedDataURL;
+  resultOverlay.style.display = 'flex';
+}
 
 function showError(msg) {
   errMsg.textContent   = msg;
@@ -326,7 +552,6 @@ async function startAR() {
 
     startOverlay.style.display = 'none';
     arUI.style.display         = 'flex';
-    takePhotoBtn.style.display = 'none';
 
     session.addEventListener('end', onSessionEnd);
   } catch (e) {
@@ -341,20 +566,28 @@ function onSessionEnd() {
   hitTestSource          = null;
   hitTestSourceRequested = false;
   reticle.visible        = false;
+  captureNextFrame       = false;
+  processingCapture      = false;
 
   renderer.setAnimationLoop(null);
-  startOverlay.style.display  = 'flex';
-  arUI.style.display          = 'none';
-  placeBtn.style.display      = 'block';
-  placeBtn.disabled           = true;
-  takePhotoBtn.style.display  = 'none';
-  scanHint.style.display      = 'block';
-  scanHint.textContent        = 'Pointez vers le sol';
+
+  // Reset all overlays
+  startOverlay.style.display   = 'flex';
+  arUI.style.display           = 'none';
+  loadingOverlay.style.display = 'none';
+  resultOverlay.style.display  = 'none';
+
+  // Reset AR-ui children to initial state
+  placeBtn.style.display   = 'block';
+  placeBtn.disabled        = true;
+  scanHint.style.display   = 'block';
+  scanHint.textContent     = 'Pointez vers le sol';
+  helperText.style.display = 'none';
+  createBtn.style.display  = 'none';
+  createBtn.disabled       = false;
 }
 
 // ─── XR frame loop ────────────────────────────────────────────────────────────
-// Only the camera pose is updated continuously (by Three.js XR manager).
-// Daguerre's matrix is written once at placement and never touched again.
 
 function onXRFrame(timestamp, frame) {
   if (!frame) { renderer.render(scene, camera); return; }
@@ -362,7 +595,6 @@ function onXRFrame(timestamp, frame) {
   const refSpace = renderer.xr.getReferenceSpace();
   const session  = renderer.xr.getSession();
 
-  // Request the hit-test source once, on the very first XR frame
   if (!hitTestSourceRequested) {
     session.requestReferenceSpace('viewer').then(vs => {
       session.requestHitTestSource({ space: vs }).then(src => {
@@ -376,7 +608,6 @@ function onXRFrame(timestamp, frame) {
     hitTestSourceRequested = true;
   }
 
-  // Before placement: update reticle from hit-test results each frame
   if (!daguerrePlaced && hitTestSource) {
     const results = frame.getHitTestResults(hitTestSource);
     if (results.length > 0) {
@@ -388,15 +619,21 @@ function onXRFrame(timestamp, frame) {
         scanHint.textContent = 'Sol detecte — appuyez pour placer';
       }
     } else {
-      reticle.visible   = false;
-      placeBtn.disabled = true;
+      reticle.visible      = false;
+      placeBtn.disabled    = true;
       scanHint.textContent = 'Pointez vers le sol';
     }
   }
 
-  // After placement: nothing in this loop touches daguerreMesh.
-  // The camera is the only object updated from XR data.
   renderer.render(scene, camera);
+
+  // Capture the composited frame immediately after render, while the buffer is live
+  if (captureNextFrame) {
+    captureNextFrame = false;
+    const dataURL = renderer.domElement.toDataURL('image/png');
+    // Yield to let the loading overlay paint before the pixel-processing loop runs
+    setTimeout(() => processDaguerreotype(dataURL), 30);
+  }
 }
 
 </script>
