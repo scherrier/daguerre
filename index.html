@@ -389,6 +389,17 @@ let captureNextFrame  = false;
 let processingCapture = false;
 let savedDataURL      = null;
 
+// Parallel getUserMedia stream used as a capturable camera background.
+// WebXR composites the live feed at the OS level (not in the WebGL framebuffer),
+// so toDataURL / readRenderTargetPixels never see it; this stream gives us a
+// real video frame to draw behind Daguerre when the daguerreotype is captured.
+let bgStream  = null;
+const bgVideo = Object.assign(document.createElement('video'), {
+  autoplay: true, muted: true, playsInline: true,
+});
+bgVideo.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
+document.body.appendChild(bgVideo);
+
 createBtn.addEventListener('click', () => {
   if (processingCapture) return;
   processingCapture       = true;
@@ -520,6 +531,29 @@ function showError(msg) {
   errMsg.style.display = 'block';
 }
 
+// ─── Background camera stream ────────────────────────────────────────────────
+
+async function startCameraBackground() {
+  try {
+    bgStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    bgVideo.srcObject = bgStream;
+    await bgVideo.play().catch(() => {});
+  } catch {
+    bgStream = null; // XR may hold exclusive camera access; capture degrades gracefully
+  }
+}
+
+function stopCameraBackground() {
+  if (bgStream) {
+    bgStream.getTracks().forEach(t => t.stop());
+    bgStream = null;
+    bgVideo.srcObject = null;
+  }
+}
+
 // ─── WebXR session ────────────────────────────────────────────────────────────
 
 let hitTestSource          = null;
@@ -549,6 +583,8 @@ async function startAR() {
     await renderer.xr.setSession(session);
     renderer.setAnimationLoop(onXRFrame);
 
+    startCameraBackground(); // fire-and-forget; fails silently if camera is exclusive
+
     startOverlay.style.display = 'none';
     arUI.style.display         = 'flex';
 
@@ -559,6 +595,7 @@ async function startAR() {
 }
 
 function onSessionEnd() {
+  stopCameraBackground();
   if (daguerreMesh) scene.remove(daguerreMesh);
   daguerreMesh           = null;
   daguerrePlaced         = false;
@@ -587,20 +624,20 @@ function onSessionEnd() {
 }
 
 // ─── Capture helper ───────────────────────────────────────────────────────────
-// In WebXR the XR compositor manages its own swap-chain framebuffer and clears
-// it after every present — toDataURL() on renderer.domElement always reads
-// blank. Re-render into a plain WebGLRenderTarget that XR never touches, then
-// read the pixels back through readRenderTargetPixels.
+// The XR swap-chain framebuffer is cleared after every present — toDataURL()
+// on renderer.domElement always reads blank. Re-render Daguerre into a plain
+// WebGLRenderTarget (which XR never touches), read the pixels back, then
+// composite the live bgVideo camera frame as the background behind him.
 function renderSceneToDataURL() {
   const w = renderer.domElement.width;
   const h = renderer.domElement.height;
 
+  // Re-render Daguerre into an off-screen WebGL framebuffer.
   const target = new THREE.WebGLRenderTarget(w, h, {
     format: THREE.RGBAFormat,
     type:   THREE.UnsignedByteType,
     depthBuffer: false,
   });
-
   renderer.setRenderTarget(target);
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
@@ -609,19 +646,38 @@ function renderSceneToDataURL() {
   renderer.readRenderTargetPixels(target, 0, 0, w, h, pixels);
   target.dispose();
 
-  // WebGL origin is bottom-left; 2D canvas is top-left — flip Y.
+  // Composite: camera background -> Daguerre (chroma-keyed alpha on top).
   const scratch = document.createElement('canvas');
   scratch.width  = w;
   scratch.height = h;
   const ctx = scratch.getContext('2d');
-  const imgData = ctx.createImageData(w, h);
+
+  // 1. Camera frame as background (if the parallel getUserMedia stream is ready).
+  if (bgStream && bgVideo.readyState >= 2 && bgVideo.videoWidth > 0) {
+    const vw    = bgVideo.videoWidth;
+    const vh    = bgVideo.videoHeight;
+    const scale = Math.max(w / vw, h / vh); // object-fit: cover
+    const dw    = vw * scale;
+    const dh    = vh * scale;
+    ctx.drawImage(bgVideo, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  }
+
+  // 2. Flip WebGL Y-axis and draw Daguerre over the camera frame.
+  //    drawImage uses source-over compositing, so the chroma-keyed alpha lets
+  //    the camera background show through wherever Daguerre is transparent.
+  const daguCanvas = document.createElement('canvas');
+  daguCanvas.width  = w;
+  daguCanvas.height = h;
+  const daguCtx = daguCanvas.getContext('2d');
+  const imgData = daguCtx.createImageData(w, h);
   for (let row = 0; row < h; row++) {
     imgData.data.set(
       pixels.subarray((h - 1 - row) * w * 4, (h - row) * w * 4),
       row * w * 4
     );
   }
-  ctx.putImageData(imgData, 0, 0);
+  daguCtx.putImageData(imgData, 0, 0);
+  ctx.drawImage(daguCanvas, 0, 0);
 
   return scratch.toDataURL('image/png');
 }
