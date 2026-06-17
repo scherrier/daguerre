@@ -125,7 +125,7 @@
 <body>
 
 <!-- Character video — hidden, started only after placement -->
-<video id="charVideo" src="daguerre.mp4" loop muted playsinline
+<video id="charVideo" src="daguerre.mp4" muted playsinline
   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
 
 <!-- DOM overlay shown during the AR session -->
@@ -254,6 +254,11 @@ function placeDaguerre() {
 
   charVideo.play().catch(() => {});
 }
+
+// Move back Daguerre video to the start when it ends
+charVideo.addEventListener('ended', () => {
+  charVideo.currentTime = 0;
+});
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
 
