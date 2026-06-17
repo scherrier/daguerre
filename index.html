@@ -132,6 +132,7 @@
 <div id="ar-ui">
   <p id="scan-hint">Pointez vers le sol</p>
   <button id="placeBtn" class="ar-cta-button" disabled>Placer Louis Daguerre ici</button>
+  <button id="takePhotoBtn" class="ar-cta-button" disabled>Prendre une photo avec Daguerre</button>
 </div>
 
 <!-- Landing screen -->
@@ -255,9 +256,10 @@ function placeDaguerre() {
   charVideo.play().catch(() => {});
 }
 
-// Move back Daguerre video to the start when it ends
+// Display take photo with Daguerre button when Daguerre video ends
 charVideo.addEventListener('ended', () => {
-  charVideo.currentTime = 0;
+  takePhotoBtn.style.display = 'block';
+  takePhotoBtn.disabled = false;
 });
 
 // ─── UI ───────────────────────────────────────────────────────────────────────
@@ -266,11 +268,26 @@ const startOverlay = document.getElementById('start-overlay');
 const arUI         = document.getElementById('ar-ui');
 const scanHint     = document.getElementById('scan-hint');
 const placeBtn     = document.getElementById('placeBtn');
+const takePhotoBtn = document.getElementById('takePhotoBtn');
 const errMsg       = document.getElementById('errMsg');
 
 placeBtn.addEventListener('click', () => {
   charVideo.play().catch(() => {}); // unlock video in user-gesture context before placement
   placeDaguerre();
+});
+
+takePhotoBtn.addEventListener('click', () => {
+  // Capture a screenshot of the current canvas
+  renderer.domElement.toBlob(blob => {
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement('a');
+    a.href    = url;
+    a.download = 'daguerre.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  });
 });
 
 function showError(msg) {
@@ -309,6 +326,7 @@ async function startAR() {
 
     startOverlay.style.display = 'none';
     arUI.style.display         = 'flex';
+    takePhotoBtn.style.display = 'none';
 
     session.addEventListener('end', onSessionEnd);
   } catch (e) {
@@ -329,6 +347,7 @@ function onSessionEnd() {
   arUI.style.display          = 'none';
   placeBtn.style.display      = 'block';
   placeBtn.disabled           = true;
+  takePhotoBtn.style.display  = 'none';
   scanHint.style.display      = 'block';
   scanHint.textContent        = 'Pointez vers le sol';
 }
