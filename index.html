@@ -15,54 +15,51 @@
       font-family: Arial, sans-serif;
     }
 
-    #video {
-      position: fixed;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
+    /* Three.js appends its <canvas> — keep it behind DOM overlays */
+    canvas {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
     }
 
-    #canvas {
+    /* ── AR overlay (visible during the XR session) ──────────────────── */
+    #ar-ui {
       position: fixed;
       inset: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-end;
+      padding-bottom: calc(32px + env(safe-area-inset-bottom));
+      pointer-events: none;   /* pass-through; buttons below opt back in */
     }
 
-    #overlay {
+    #scan-hint {
+      color: rgba(255, 255, 255, 0.9);
+      font-size: clamp(14px, 3.5vw, 17px);
+      font-weight: 500;
+      margin-bottom: 18px;
+      text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
+      text-align: center;
+      padding: 0 24px;
+    }
+
+    /* ── Landing screen ──────────────────────────────────────────────── */
+    #start-overlay {
       position: fixed;
       inset: 0;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      background: rgba(0, 0, 0, 0.7);
+      background: rgba(0, 0, 0, 0.75);
       z-index: 10;
-      cursor: pointer;
     }
 
-    #overlay h1 {
-      color: #fff;
-      font-size: clamp(22px, 5vw, 36px);
-      margin-bottom: 12px;
-      letter-spacing: 1px;
-    }
-
-    #overlay p {
-      color: #ccc;
-      font-size: clamp(14px, 3vw, 18px);
-      margin-bottom: 32px;
-    }
-
+    /* ── Shared button style ─────────────────────────────────────────── */
     .ar-cta-button {
-      position: fixed;
-      left: 50%;
-      bottom: calc(24px + env(safe-area-inset-bottom));
-      transform: translateX(-50%);
-      z-index: 20;
-
+      display: inline-block;
       min-height: 56px;
       min-width: 280px;
       max-width: calc(100vw - 32px);
@@ -78,26 +75,21 @@
 
       color: #ffffff;
       background: linear-gradient(135deg, #165dff 0%, #00b8d9 100%);
-
       border: 1px solid rgba(255, 255, 255, 0.36);
       border-radius: 18px;
-
       box-shadow:
         0 14px 32px rgba(0, 118, 255, 0.32),
         inset 0 1px 0 rgba(255, 255, 255, 0.28);
-
       cursor: pointer;
       user-select: none;
       -webkit-tap-highlight-color: transparent;
-
-      transition:
-        transform 160ms ease,
-        box-shadow 160ms ease,
-        filter 160ms ease;
+      pointer-events: auto;
+      transition: transform 160ms ease, box-shadow 160ms ease,
+                  filter 160ms ease, opacity 160ms ease;
     }
 
     .ar-cta-button:active {
-      transform: translateX(-50%) translateY(1px);
+      transform: translateY(1px);
       filter: brightness(0.96);
       box-shadow:
         0 8px 18px rgba(0, 118, 255, 0.26),
@@ -105,7 +97,7 @@
     }
 
     .ar-cta-button:disabled {
-      opacity: 0.55;
+      opacity: 0.45;
       cursor: not-allowed;
       pointer-events: none;
     }
@@ -124,396 +116,265 @@
       font-size: 14px;
       margin-top: 16px;
       display: none;
+      text-align: center;
+      max-width: 300px;
+      padding: 0 16px;
     }
-
   </style>
 </head>
 <body>
 
-<video id="video" autoplay playsinline muted></video>
-<canvas id="canvas"></canvas>
-
-<video id="charVideo" src="daguerre.mp4" autoplay loop muted playsinline
+<!-- Character video — hidden, started only after placement -->
+<video id="charVideo" src="daguerre.mp4" loop muted playsinline
   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
 
-<div id="overlay">
+<!-- DOM overlay shown during the AR session -->
+<div id="ar-ui">
+  <p id="scan-hint">Pointez vers le sol</p>
+  <button id="placeBtn" class="ar-cta-button" disabled>Placer Louis Daguerre ici</button>
+</div>
+
+<!-- Landing screen -->
+<div id="start-overlay">
   <button id="startBtn" class="ar-cta-button">Rencontrer Louis Daguerre</button>
   <div id="errMsg"></div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
 <script>
-// ─── Canvas setup ────────────────────────────────────────────────────────────
 
-const canvas = document.getElementById('canvas');
-const ctx    = canvas.getContext('2d');
+// ─── Scene ───────────────────────────────────────────────────────────────────
 
-function resize() {
-  canvas.width  = window.innerWidth;
-  canvas.height = window.innerHeight;
-}
-resize();
-window.addEventListener('resize', resize);
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
 
-// ─── Camera ──────────────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
 
-const video    = document.getElementById('video');
-const overlay  = document.getElementById('overlay');
-const errMsg   = document.getElementById('errMsg');
-let facingMode = 'environment';
-let isVideoPlaying = false;
-
-async function startCamera(mode) {
-  try {
-    if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: mode }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false
-    });
-    isVideoPlaying = true;
-    video.srcObject = stream;
-    facingMode = mode;
-    overlay.style.display = 'none';
-  } catch (e) {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      isVideoPlaying = true;
-      video.srcObject = stream;
-      overlay.style.display = 'none';
-    } catch (err) {
-      errMsg.textContent = 'Camera unavailable: ' + err.message;
-      errMsg.style.display = 'block';
-    }
-  }
-}
-
-document.getElementById('startBtn').addEventListener(
-  'click',
-  () => {
-    startCamera(facingMode)
-    startOrientationTracking();
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ─── Device orientation (ground anchoring) ──────────────────────────────────
-// No real surface tracking here — we approximate a fixed ground-anchored
-// point by remembering the phone's heading/tilt when the character is
-// placed, then shifting it on screen as the phone pans/tilts away from
-// that reference, using rough camera FOV angles.
+// ─── Reticle (hit-test indicator on the detected ground) ─────────────────────
 
-const HORIZONTAL_FOV = 65; // approx environment-camera horizontal FOV (deg)
-const VERTICAL_FOV   = 50; // approx environment-camera vertical FOV (deg)
-const SMOOTHING       = 0.15; // exponential smoothing factor for jitter
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.10, 0.13, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x50d2ff, side: THREE.DoubleSide })
+);
+reticle.matrixAutoUpdate = false; // matrix set from hit-test each frame
+reticle.visible = false;
+scene.add(reticle);
 
-let placedOrientation  = null;
-let smoothedDeltaAlpha = 0;
-let smoothedDeltaBeta  = 0;
-let currentOrientation  = null; // latest reading, used to anchor at ground-found moment
-let currentBeta         = null;
-let orientationAvailable = false;
-
-function angleDelta(a, b) {
-  let d = a - b;
-  while (d > 180) d -= 360;
-  while (d < -180) d += 360;
-  return d;
-}
-
-function handleOrientation(e) {
-  if (e.alpha === null || e.beta === null) return;
-  orientationAvailable = true; // only mark available once we have real sensor data
-  currentBeta        = e.beta;
-  currentOrientation = { alpha: e.alpha, beta: e.beta };
-  if (!placedOrientation) return; // anchor set only when ground is found
-  const rawDeltaAlpha = angleDelta(e.alpha, placedOrientation.alpha);
-  const rawDeltaBeta  = e.beta - placedOrientation.beta;
-  smoothedDeltaAlpha += SMOOTHING * (rawDeltaAlpha - smoothedDeltaAlpha);
-  smoothedDeltaBeta  += SMOOTHING * (rawDeltaBeta  - smoothedDeltaBeta);
-}
-
-function startOrientationTracking() {
-  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-    DeviceOrientationEvent.requestPermission()
-      .then(state => { if (state === 'granted') window.addEventListener('deviceorientation', handleOrientation); })
-      .catch(() => {});
-  } else {
-    window.addEventListener('deviceorientation', handleOrientation);
-  }
-}
-
-// Resolves a character's anchored ground position into screen-space
-// fractions, given how far the phone has panned/tilted since placement.
-function getGroundScreenPos(char) {
-  if (!placedOrientation) return { xFrac: char.xFrac, yFrac: char.yFrac, visible: true };
-  const xFrac = char.xFrac - smoothedDeltaAlpha / HORIZONTAL_FOV;
-  const yFrac = char.yFrac - smoothedDeltaBeta  / VERTICAL_FOV;
-  const visible = xFrac > -0.35 && xFrac < 1.35 && yFrac > -0.35 && yFrac < 1.35;
-  return { xFrac, yFrac, visible };
-}
-
-// ─── Ground detection ────────────────────────────────────────────────────────
-// Waits for the phone to be held upright (beta in a plausible range) before
-// anchoring Daguerre and fading him in. On desktop (no orientation API) the
-// ground is considered found after a short fixed delay.
-
-const GROUND_DETECT_MS = 2000; // ms of stable valid tilt before "found"
-const BETA_MIN         = 35;   // device tilted at least 35° from flat
-const BETA_MAX         = 100;
-
-let groundFound       = false;
-let groundDetectStart = null;
-let groundOpacity     = 0;   // Daguerre fades in from 0 → 1
-let scanOpacity       = 1;   // scan indicator fades out from 1 → 0
-
-function isLookingAtGround() {
-  if (!orientationAvailable) return true; // desktop fallback: always ready
-  return currentBeta !== null && currentBeta >= BETA_MIN && currentBeta <= BETA_MAX;
-}
-
-function updateGroundDetection(ts) {
-  if (groundFound) {
-    groundOpacity = Math.min(1, groundOpacity + 0.03);
-    scanOpacity   = Math.max(0, scanOpacity   - 0.05);
-    return;
-  }
-  if (isLookingAtGround()) {
-    if (!groundDetectStart) groundDetectStart = ts;
-    if (ts - groundDetectStart >= GROUND_DETECT_MS) {
-      groundFound        = true;
-      placedOrientation  = currentOrientation ? { ...currentOrientation } : null;
-      smoothedDeltaAlpha = 0;
-      smoothedDeltaBeta  = 0;
-    }
-  } else {
-    groundDetectStart = null;
-  }
-}
-
-function drawScanIndicator(ts) {
-  if (scanOpacity <= 0) return;
-
-  const cx = canvas.width  * 0.5;
-  const cy = canvas.height * 0.84;
-  const rx = canvas.width  * 0.22;
-  const ry = canvas.height * 0.055;
-
-  const looking  = isLookingAtGround();
-  const progress = looking && groundDetectStart
-    ? Math.min(1, (ts - groundDetectStart) / GROUND_DETECT_MS)
-    : 0;
-
-  ctx.save();
-  ctx.globalAlpha = scanOpacity;
-
-  // Build an oval path via scale+arc — avoids ctx.ellipse which is absent on
-  // some older mobile WebViews. Canvas path points are stored in device coords,
-  // so the transform can be restored before stroking without losing the shape.
-  function ovalPath(startAngle, endAngle) {
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.scale(rx, ry);
-    ctx.beginPath();
-    ctx.arc(0, 0, 1, startAngle, endAngle);
-    ctx.restore();
-  }
-
-  // Dashed oval outline
-  ovalPath(0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(255,255,255,0.3)';
-  ctx.lineWidth   = 2;
-  ctx.setLineDash([8, 6]);
-  ctx.stroke();
-
-  // Progress arc
-  if (progress > 0) {
-    ovalPath(-Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
-    ctx.strokeStyle = 'rgba(80, 210, 255, 0.9)';
-    ctx.lineWidth   = 3;
-    ctx.setLineDash([]);
-    ctx.stroke();
-  }
-
-  // Orbiting dots
-  const t = (ts / 900) % 1;
-  ctx.setLineDash([]);
-  for (let i = 0; i < 6; i++) {
-    const angle = (i / 6) * Math.PI * 2 + t * Math.PI * 2;
-    const alpha = 0.35 + 0.65 * ((i / 6 + t) % 1);
-    ctx.beginPath();
-    ctx.arc(cx + Math.cos(angle) * rx, cy + Math.sin(angle) * ry, 3, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(80,210,255,' + alpha.toFixed(2) + ')';
-    ctx.fill();
-  }
-
-  // Status label
-  const fontSize = Math.max(13, Math.round(canvas.width * 0.033));
-  ctx.font      = fontSize + 'px Arial';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.fillText(
-    groundFound ? 'Ground found!'               :
-    looking     ? 'Detecting ground surface...' :
-                  'Point camera at the ground',
-    cx, cy + ry + fontSize + 6
-  );
-
-  ctx.restore();
-}
-
-// ─── WebGL chroma key ────────────────────────────────────────────────────────
-// Runs on GPU at native video resolution — no downscaling, smooth edges.
+// ─── Daguerre character ───────────────────────────────────────────────────────
 
 const charVideo = document.getElementById('charVideo');
+const DAGUERRE_HEIGHT = 1.72; // metres — calibrated to real-world standing height
 
-const glCanvas = document.createElement('canvas');
-glCanvas.style.cssText = 'position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;';
-document.body.appendChild(glCanvas);
+const videoTex = new THREE.VideoTexture(charVideo);
+videoTex.minFilter = THREE.LinearFilter;
+videoTex.magFilter = THREE.LinearFilter;
 
-const gl = glCanvas.getContext('webgl',             { alpha: true, premultipliedAlpha: false })
-        || glCanvas.getContext('experimental-webgl', { alpha: true, premultipliedAlpha: false });
+// Chroma-key shader — same algorithm as before, now as a Three.js material
+const daguerreMat = new THREE.ShaderMaterial({
+  uniforms: { uTex: { value: videoTex } },
+  vertexShader: `
+    varying vec2 vUV;
+    void main() {
+      vUV = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    precision mediump float;
+    uniform sampler2D uTex;
+    varying vec2 vUV;
+    void main() {
+      vec4 c      = texture2D(uTex, vUV);
+      float green = c.g - max(c.r, c.b);
+      float a     = 1.0 - smoothstep(0.01, 0.2, green);
+      float spill = max(0.0, green);
+      gl_FragColor = vec4(c.r, c.g - spill, c.b, a);
+    }
+  `,
+  transparent: true,
+  side: THREE.FrontSide,
+  depthWrite: false,
+});
 
-// Vertex shader: fullscreen quad, flip Y so video is right-side up
-const VS = `
-  attribute vec2 aPos;
-  varying vec2 vUV;
-  void main() {
-    vUV = vec2(aPos.x * 0.5 + 0.5, aPos.y * 0.5 + 0.5);
-    gl_Position = vec4(aPos, 0.0, 1.0);
+let daguerreMesh   = null;
+let daguerrePlaced = false;
+
+function buildDaguerreMesh() {
+  if (daguerreMesh) return;
+  const vw     = charVideo.videoWidth  || 9;  // fallback 9:16 if metadata not yet ready
+  const vh     = charVideo.videoHeight || 16;
+  const planeW = DAGUERRE_HEIGHT * (vw / vh);
+  daguerreMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(planeW, DAGUERRE_HEIGHT),
+    daguerreMat
+  );
+  daguerreMesh.matrixAutoUpdate = false; // position written once at placement, never again
+}
+
+charVideo.addEventListener('loadedmetadata', buildDaguerreMesh);
+if (charVideo.readyState >= 1) buildDaguerreMesh();
+
+// ─── Placement ────────────────────────────────────────────────────────────────
+
+function placeDaguerre() {
+  if (!reticle.visible || daguerrePlaced) return;
+  daguerrePlaced = true;
+
+  buildDaguerreMesh();
+
+  // Ground position from the reticle (which mirrors the current hit-test result)
+  const hitPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+
+  // Compute Y-only rotation so Daguerre faces the camera at placement time,
+  // then freeze that rotation — never updated again.
+  const cam   = camera.position;
+  const theta = Math.atan2(cam.x - hitPos.x, cam.z - hitPos.z);
+
+  // Set world matrix: rotate around Y to face camera, shift centre up by half height.
+  // matrixAutoUpdate = false means Three.js will never overwrite this matrix.
+  daguerreMesh.matrix
+    .makeRotationY(theta)
+    .setPosition(hitPos.x, hitPos.y + DAGUERRE_HEIGHT / 2, hitPos.z);
+
+  scene.add(daguerreMesh); // added to scene, NOT to camera — stays fixed in world space
+
+  reticle.visible        = false;
+  placeBtn.style.display = 'none';
+  scanHint.style.display = 'none';
+
+  charVideo.play().catch(() => {});
+}
+
+// ─── UI ───────────────────────────────────────────────────────────────────────
+
+const startOverlay = document.getElementById('start-overlay');
+const arUI         = document.getElementById('ar-ui');
+const scanHint     = document.getElementById('scan-hint');
+const placeBtn     = document.getElementById('placeBtn');
+const errMsg       = document.getElementById('errMsg');
+
+placeBtn.addEventListener('click', () => {
+  charVideo.play().catch(() => {}); // unlock video in user-gesture context before placement
+  placeDaguerre();
+});
+
+function showError(msg) {
+  errMsg.textContent   = msg;
+  errMsg.style.display = 'block';
+}
+
+// ─── WebXR session ────────────────────────────────────────────────────────────
+
+let hitTestSource          = null;
+let hitTestSourceRequested = false;
+
+document.getElementById('startBtn').addEventListener('click', startAR);
+
+async function startAR() {
+  if (!navigator.xr) {
+    showError('WebXR non disponible. Essayez Chrome sur Android.');
+    return;
   }
-`;
-
-// Fragment shader: smoothstep chroma key — soft transparent edges, no hard cutoff
-const FS = `
-  precision mediump float;
-  uniform sampler2D uTex;
-  varying vec2 vUV;
-  void main() {
-    vec4 c = texture2D(uTex, vUV);
-    // How much greener this pixel is than its red/blue channels
-    float greenness = c.g - max(c.r, c.b);
-    // Aggressive removal: starts at 0.05, fully transparent by 0.3
-    float a = 1.0 - smoothstep(0.01, 0.2, greenness);
-    // Spill suppression: cap green channel at max(r,b) on every pixel,
-    // including fully opaque ones like hair that pick up green light from the screen
-    float spill = max(0.0, greenness);
-    vec3 col = vec3(c.r, c.g - spill, c.b);
-    gl_FragColor = vec4(col, a);
+  const supported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  if (!supported) {
+    showError('RA non supportee sur cet appareil ou navigateur.');
+    return;
   }
-`;
 
-function compileShader(type, src) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  return s;
+  try {
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'],
+      optionalFeatures: ['dom-overlay'],
+      domOverlay: { root: arUI },
+    });
+
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(session);
+    renderer.setAnimationLoop(onXRFrame);
+
+    startOverlay.style.display = 'none';
+    arUI.style.display         = 'flex';
+
+    session.addEventListener('end', onSessionEnd);
+  } catch (e) {
+    showError('Impossible de demarrer la RA : ' + e.message);
+  }
 }
 
-const prog = gl.createProgram();
-gl.attachShader(prog, compileShader(gl.VERTEX_SHADER,   VS));
-gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, FS));
-gl.linkProgram(prog);
-gl.useProgram(prog);
+function onSessionEnd() {
+  if (daguerreMesh) scene.remove(daguerreMesh);
+  daguerreMesh           = null;
+  daguerrePlaced         = false;
+  hitTestSource          = null;
+  hitTestSourceRequested = false;
+  reticle.visible        = false;
 
-// Fullscreen quad: two triangles as a strip
-const quadBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-const posLoc = gl.getAttribLocation(prog, 'aPos');
-gl.enableVertexAttribArray(posLoc);
-gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-
-// Video texture
-const tex = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, tex);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
-gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-gl.clearColor(0, 0, 0, 0);
-
-let charReady = false;
-
-function initGL() {
-  if (charReady) return;
-  const vw = charVideo.videoWidth, vh = charVideo.videoHeight;
-  if (!vw || !vh) return;
-  // Use native video resolution — no quality loss
-  glCanvas.width  = vw;
-  glCanvas.height = vh;
-  gl.viewport(0, 0, vw, vh);
-  charReady = true;
+  renderer.setAnimationLoop(null);
+  startOverlay.style.display  = 'flex';
+  arUI.style.display          = 'none';
+  placeBtn.style.display      = 'block';
+  placeBtn.disabled           = true;
+  scanHint.style.display      = 'block';
+  scanHint.textContent        = 'Pointez vers le sol';
 }
 
-charVideo.addEventListener('loadedmetadata', initGL);
-if (charVideo.readyState >= 1) initGL();
-charVideo.play().catch(() => {});
+// ─── XR frame loop ────────────────────────────────────────────────────────────
+// Only the camera pose is updated continuously (by Three.js XR manager).
+// Daguerre's matrix is written once at placement and never touched again.
 
-function processCharFrame() {
-  if (!charReady || charVideo.readyState < 2) return false;
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, charVideo);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  return true;
-}
+function onXRFrame(timestamp, frame) {
+  if (!frame) { renderer.render(scene, camera); return; }
 
-// ─── Characters ──────────────────────────────────────────────────────────────
+  const refSpace = renderer.xr.getReferenceSpace();
+  const session  = renderer.xr.getSession();
 
-let characters    = [];
-let charIdCounter = 0;
+  // Request the hit-test source once, on the very first XR frame
+  if (!hitTestSourceRequested) {
+    session.requestReferenceSpace('viewer').then(vs => {
+      session.requestHitTestSource({ space: vs }).then(src => {
+        hitTestSource = src;
+      });
+    });
+    session.addEventListener('end', () => {
+      hitTestSource          = null;
+      hitTestSourceRequested = false;
+    });
+    hitTestSourceRequested = true;
+  }
 
-function spawnCharacter(xFrac, yFrac) {
-  characters.push({
-    id:    charIdCounter++,
-    xFrac,
-    yFrac,
-    dir:   -1,
-    speed: 1,
-    scale: 3
-  });
-}
-
-spawnCharacter(0.5, 0.9);
-
-// ─── Character renderer ──────────────────────────────────────────────────────
-
-function drawCharacter(char) {
-  if (!charReady) return;
-  const { dir, scale } = char;
-  const { xFrac, yFrac, visible } = getGroundScreenPos(char);
-  if (!visible) return;
-  const gx = xFrac * canvas.width;
-  const gy = yFrac * canvas.height;
-
-  const drawH  = canvas.height * 0.30 * scale;
-  const aspect = glCanvas.width / glCanvas.height;
-  const drawW  = drawH * aspect;
-
-  ctx.save();
-  ctx.translate(gx, gy);
-  if (dir === -1) ctx.scale(-1, 1);
-  ctx.drawImage(glCanvas, -drawW / 2, -drawH, drawW, drawH);
-  ctx.restore();
-}
-
-// ─── Main loop ───────────────────────────────────────────────────────────────
-
-function loop(ts) {
-  requestAnimationFrame(loop);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  processCharFrame();
-  if (isVideoPlaying) {
-    updateGroundDetection(ts);
-    drawScanIndicator(ts);
-    if (groundFound) {
-      ctx.save();
-      ctx.globalAlpha = groundOpacity;
-      drawCharacter(characters[0]);
-      ctx.restore();
+  // Before placement: update reticle from hit-test results each frame
+  if (!daguerrePlaced && hitTestSource) {
+    const results = frame.getHitTestResults(hitTestSource);
+    if (results.length > 0) {
+      const pose = results[0].getPose(refSpace);
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+      if (placeBtn.disabled) {
+        placeBtn.disabled    = false;
+        scanHint.textContent = 'Sol detecte — appuyez pour placer';
+      }
+    } else {
+      reticle.visible   = false;
+      placeBtn.disabled = true;
+      scanHint.textContent = 'Pointez vers le sol';
     }
   }
+
+  // After placement: nothing in this loop touches daguerreMesh.
+  // The camera is the only object updated from XR data.
+  renderer.render(scene, camera);
 }
 
-requestAnimationFrame(loop);
 </script>
 </body>
 </html>
