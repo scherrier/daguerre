@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
   <title>Daguerre</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -15,18 +15,22 @@
       font-family: Arial, sans-serif;
     }
 
-    /* Three.js appends its <canvas> — keep it behind DOM overlays */
-    canvas {
+    /* Camera feed + AR scene, drawn into this canvas by the AR provider.
+       There's no dom-overlay compositor here (that's a WebXR-only concept),
+       so every overlay below needs an explicit z-index above this canvas. */
+    #camerafeed {
       position: fixed !important;
       inset: 0 !important;
       width: 100% !important;
       height: 100% !important;
+      z-index: 0;
     }
 
-    /* ── AR overlay (visible during the XR session) ──────────────────── */
+    /* ── AR overlay (visible while the AR provider is running) ────────── */
     #ar-ui {
       position: fixed;
       inset: 0;
+      z-index: 1;
       display: none;
       flex-direction: column;
       align-items: center;
@@ -210,11 +214,14 @@
 </head>
 <body>
 
+<!-- Camera feed + AR scene, drawn into this canvas by the AR provider -->
+<canvas id="camerafeed"></canvas>
+
 <!-- Character video — no loop; plays once, holds the last frame -->
 <video id="charVideo" src="daguerre.mp4" muted playsinline
   style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
 
-<!-- DOM overlay shown during the AR session -->
+<!-- DOM overlay shown while the AR provider is running -->
 <div id="ar-ui">
   <!-- Phase 1: scanning + placement -->
   <p id="scan-hint">Pointez vers le sol</p>
@@ -228,12 +235,12 @@
     Créer un daguerréotype
   </button>
 
-  <!-- Processing state — inside the DOM overlay root so the XR compositor shows it -->
+  <!-- Processing state -->
   <div id="loading-overlay">
     <p id="loading-text">Création du daguerréotype...</p>
   </div>
 
-  <!-- Result screen — inside the DOM overlay root for the same reason -->
+  <!-- Result screen -->
   <div id="result-overlay">
     <img id="result-img" alt="" />
     <div id="result-actions">
@@ -250,36 +257,157 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+<!-- 8th Wall self-hosted engine binary: no app key, no 8thwall.com account needed.
+     Works via getUserMedia + its own SLAM tracking, so — unlike WebXR — it runs
+     on both Android Chrome and iOS Safari. -->
+<script async src="https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@1/dist/xr.js" data-preload-chunks="slam"></script>
+<script src="//cdn.8thwall.com/web/xrextras/xrextras.js"></script>
+
 <script>
+/* globals XR8 XRExtras THREE */
 
-// ─── Scene ───────────────────────────────────────────────────────────────────
+// ─── AR Provider Layer ─────────────────────────────────────────────────────
+// Everything specific to "how AR works on this device" lives here, behind
+// the small ARProvider interface below. App Logic never touches XR8, THREE
+// scene/camera, or raycasting directly — it only calls these methods. If
+// this provider ever needs replacing (e.g. with MindAR), this is the only
+// block that should change.
+//
+// 8th Wall has no real surface/plane detection (unlike WebXR's hit-test) —
+// it only provides 6DoF SLAM camera tracking. Placement is approximated by
+// raycasting from the centre of the screen against an invisible plane fixed
+// at y=0, with the camera assumed to start at EYE_HEIGHT above it.
 
-const scene  = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+const ARProvider = (() => {
+  const EYE_HEIGHT = 1.2; // assumed phone height above the ground while aiming down at it, metres
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(window.devicePixelRatio);
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.xr.enabled = true;
-document.body.appendChild(renderer.domElement);
+  let scene  = null;
+  let camera = null;
+  let ground = null;
+  let reticleMesh    = null;
+  let reticlePoint   = null;
+  let trackingReticle = true;
+  let visibilityCb    = null;
+  let pendingCapture  = null;
 
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+  const raycaster = new THREE.Raycaster();
 
-// ─── Reticle ─────────────────────────────────────────────────────────────────
+  function arPipelineModule() {
+    return {
+      name: 'ar-provider',
 
-const reticle = new THREE.Mesh(
-  new THREE.RingGeometry(0.10, 0.13, 32).rotateX(-Math.PI / 2),
-  new THREE.MeshBasicMaterial({ color: 0x50d2ff, side: THREE.DoubleSide })
-);
-reticle.matrixAutoUpdate = false;
-reticle.visible = false;
-scene.add(reticle);
+      onStart: () => {
+        ({ scene, camera } = XR8.Threejs.xrScene());
 
-// ─── Daguerre character ───────────────────────────────────────────────────────
+        reticleMesh = new THREE.Mesh(
+          new THREE.RingGeometry(0.10, 0.13, 32).rotateX(-Math.PI / 2),
+          new THREE.MeshBasicMaterial({ color: 0x50d2ff, side: THREE.DoubleSide }),
+        );
+        reticleMesh.matrixAutoUpdate = false;
+        reticleMesh.visible = false;
+        scene.add(reticleMesh);
+
+        // Invisible stand-in for "the ground" — there's no real surface
+        // detection, this plane is always at y=0 regardless of where the
+        // actual floor is in the camera image.
+        ground = new THREE.Mesh(
+          new THREE.PlaneGeometry(100, 100),
+          new THREE.MeshBasicMaterial({ visible: false }),
+        );
+        ground.rotateX(-Math.PI / 2);
+        scene.add(ground);
+
+        camera.position.set(0, EYE_HEIGHT, 0);
+        XR8.XrController.updateCameraProjectionMatrix({
+          origin: camera.position,
+          facing: camera.quaternion,
+        });
+      },
+
+      // Runs every frame before rendering. Only updates the reticle before
+      // something has been placed.
+      onUpdate: () => {
+        if (!trackingReticle) return;
+
+        raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+        const hits = raycaster.intersectObject(ground);
+        const wasVisible = reticleMesh.visible;
+
+        if (hits.length && hits[0].distance < 6) {
+          reticlePoint = hits[0].point.clone();
+          reticleMesh.visible = true;
+          reticleMesh.matrix.identity().setPosition(reticlePoint);
+        } else {
+          reticlePoint = null;
+          reticleMesh.visible = false;
+        }
+
+        if (reticleMesh.visible !== wasVisible) visibilityCb?.(reticleMesh.visible);
+      },
+
+      // Runs every frame after the camera feed + three.js scene have been
+      // drawn into the canvas. This is a plain canvas (no XR swap-chain to
+      // worry about), so the just-drawn pixels are still readable here.
+      onRender: () => {
+        if (!pendingCapture) return;
+        const cb = pendingCapture;
+        pendingCapture = null;
+        cb(document.getElementById('camerafeed').toDataURL('image/png'));
+      },
+    };
+  }
+
+  return {
+    start({ canvas, onError }) {
+      window.addEventListener('xrerror', (e) => {
+        onError?.(e.detail?.message || e.detail?.title || 'AR error');
+      });
+
+      const begin = () => {
+        XR8.addCameraPipelineModules([
+          XR8.GlTextureRenderer.pipelineModule(),      // draws the camera feed
+          XR8.Threejs.pipelineModule(),                // sets up the three.js scene/camera
+          XR8.XrController.pipelineModule(),           // SLAM 6DoF tracking
+          XRExtras.AlmostThere.pipelineModule(),       // unsupported-browser hints
+          XRExtras.FullWindowCanvas.pipelineModule(),  // makes the canvas fill the window
+          XRExtras.Loading.pipelineModule(),           // loading screen while camera/SLAM start
+          XRExtras.RuntimeError.pipelineModule(),       // error overlay on crash
+          arPipelineModule(),
+        ]);
+        XR8.run({ canvas });
+      };
+
+      if (window.XR8) { begin(); return; }
+      window.addEventListener('xrextrasloaded', begin, { once: true });
+    },
+
+    onReticleVisibilityChange(cb) { visibilityCb = cb; },
+    getReticlePoint()             { return reticlePoint; },
+    getCameraPosition()           { return camera.position; },
+
+    // Adds an object to the world (not the camera) at a fixed pose. The pose
+    // is set once and never recalculated, so the object stays put in world
+    // space regardless of how the camera moves afterwards.
+    placeObjectInWorld(object3D, position, rotationY) {
+      trackingReticle      = false;
+      reticleMesh.visible  = false;
+
+      object3D.matrixAutoUpdate = false;
+      object3D.matrix.makeRotationY(rotationY).setPosition(position.x, position.y, position.z);
+      scene.add(object3D);
+    },
+
+    // Captures the composited camera + AR scene on the next rendered frame.
+    requestCapture(cb) { pendingCapture = cb; },
+  };
+})();
+
+// ─── App Logic Layer ────────────────────────────────────────────────────────
+// UI states, video playback, placement decision, and the daguerreotype
+// filter — unchanged in spirit from the WebXR version. The only difference
+// is that AR specifics are reached through ARProvider instead of touching
+// THREE/XR8 directly.
 
 const charVideo = document.getElementById('charVideo');
 const DAGUERRE_HEIGHT = 1.72; // metres
@@ -326,7 +454,6 @@ function buildDaguerreMesh() {
     new THREE.PlaneGeometry(planeW, DAGUERRE_HEIGHT),
     daguerreMat
   );
-  daguerreMesh.matrixAutoUpdate = false;
 }
 
 charVideo.addEventListener('loadedmetadata', buildDaguerreMesh);
@@ -341,22 +468,21 @@ charVideo.addEventListener('ended', () => {
 // ─── Placement ────────────────────────────────────────────────────────────────
 
 function placeDaguerre() {
-  if (!reticle.visible || daguerrePlaced) return;
+  const point = ARProvider.getReticlePoint();
+  if (!point || daguerrePlaced) return;
   daguerrePlaced = true;
 
   buildDaguerreMesh();
 
-  const hitPos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
-  const cam    = camera.position;
-  const theta  = Math.atan2(cam.x - hitPos.x, cam.z - hitPos.z);
+  const cam   = ARProvider.getCameraPosition();
+  const theta = Math.atan2(cam.x - point.x, cam.z - point.z);
 
-  daguerreMesh.matrix
-    .makeRotationY(theta)
-    .setPosition(hitPos.x, hitPos.y + DAGUERRE_HEIGHT / 2, hitPos.z);
+  ARProvider.placeObjectInWorld(
+    daguerreMesh,
+    { x: point.x, y: point.y + DAGUERRE_HEIGHT / 2, z: point.z },
+    theta,
+  );
 
-  scene.add(daguerreMesh);
-
-  reticle.visible        = false;
   placeBtn.style.display = 'none';
   scanHint.style.display = 'none';
 
@@ -366,39 +492,42 @@ function placeDaguerre() {
 // ─── UI references ────────────────────────────────────────────────────────────
 
 const startOverlay   = document.getElementById('start-overlay');
-const arUI           = document.getElementById('ar-ui');
-const scanHint       = document.getElementById('scan-hint');
-const placeBtn       = document.getElementById('placeBtn');
-const helperText     = document.getElementById('helperText');
-const createBtn      = document.getElementById('createBtn');
-const errMsg         = document.getElementById('errMsg');
-const loadingOverlay = document.getElementById('loading-overlay');
-const resultOverlay  = document.getElementById('result-overlay');
-const resultImg      = document.getElementById('result-img');
-const saveBtn        = document.getElementById('saveBtn');
-const resumeBtn      = document.getElementById('resumeBtn');
+const arUI            = document.getElementById('ar-ui');
+const scanHint        = document.getElementById('scan-hint');
+const placeBtn        = document.getElementById('placeBtn');
+const helperText      = document.getElementById('helperText');
+const createBtn       = document.getElementById('createBtn');
+const errMsg          = document.getElementById('errMsg');
+const loadingOverlay  = document.getElementById('loading-overlay');
+const resultOverlay   = document.getElementById('result-overlay');
+const resultImg       = document.getElementById('result-img');
+const saveBtn         = document.getElementById('saveBtn');
+const resumeBtn       = document.getElementById('resumeBtn');
 
 placeBtn.addEventListener('click', () => {
   charVideo.play().catch(() => {});
   placeDaguerre();
 });
 
+ARProvider.onReticleVisibilityChange((visible) => {
+  placeBtn.disabled    = !visible;
+  scanHint.textContent = visible ? 'Sol detecte — appuyez pour placer' : 'Pointez vers le sol';
+});
+
 // ─── Capture + daguerreotype filter ──────────────────────────────────────────
 
-let captureNextFrame  = false;
 let processingCapture = false;
 let savedDataURL      = null;
 
-// XRWebGLBinding gives access to the same camera texture WebXR composites.
-// Created once the XR session starts; null when no session is active.
-let xrBinding = null;
-
 createBtn.addEventListener('click', () => {
   if (processingCapture) return;
-  processingCapture       = true;
-  createBtn.disabled      = true;
+  processingCapture = true;
+  createBtn.disabled = true;
   loadingOverlay.style.display = 'flex';
-  captureNextFrame = true;
+
+  ARProvider.requestCapture((dataURL) => {
+    setTimeout(() => processDaguerreotype(dataURL), 30);
+  });
 });
 
 saveBtn.addEventListener('click', () => {
@@ -604,232 +733,17 @@ function showError(msg) {
   errMsg.style.display = 'block';
 }
 
-// ─── WebXR session ────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 
-let hitTestSource          = null;
-let hitTestSourceRequested = false;
-
-document.getElementById('startBtn').addEventListener('click', startAR);
-
-async function startAR() {
-  if (!navigator.xr) {
-    showError('WebXR non disponible. Essayez Chrome sur Android.');
-    return;
-  }
-  const supported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
-  if (!supported) {
-    showError('RA non supportee sur cet appareil ou navigateur.');
-    return;
-  }
-
-  try {
-    const session = await navigator.xr.requestSession('immersive-ar', {
-      requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay', 'camera-access'],
-      domOverlay: { root: arUI },
-    });
-
-    renderer.xr.setReferenceSpaceType('local');
-    await renderer.xr.setSession(session); // makes the GL context XR-compatible
-
-    // XRWebGLBinding uses the same GL context Three.js uses for XR, giving us
-    // getCameraImage() — the exact texture the compositor is showing.
-    if (session.enabledFeatures?.includes('camera-access')) {
-      xrBinding = new XRWebGLBinding(session, renderer.getContext());
-    }
-
-    renderer.setAnimationLoop(onXRFrame);
-
-    startOverlay.style.display = 'none';
-    arUI.style.display         = 'flex';
-
-    session.addEventListener('end', onSessionEnd);
-  } catch (e) {
-    showError('Impossible de demarrer la RA : ' + e.message);
-  }
-}
-
-function onSessionEnd() {
-  xrBinding = null;
-  if (daguerreMesh) scene.remove(daguerreMesh);
-  daguerreMesh           = null;
-  daguerrePlaced         = false;
-  hitTestSource          = null;
-  hitTestSourceRequested = false;
-  reticle.visible        = false;
-  captureNextFrame       = false;
-  processingCapture      = false;
-
-  renderer.setAnimationLoop(null);
-
-  // Reset all overlays
-  startOverlay.style.display   = 'flex';
-  arUI.style.display           = 'none';
-  loadingOverlay.style.display = 'none';
-  resultOverlay.style.display  = 'none';
-
-  // Reset AR-ui children to initial state
-  placeBtn.style.display   = 'block';
-  placeBtn.disabled        = true;
-  scanHint.style.display   = 'block';
-  scanHint.textContent     = 'Pointez vers le sol';
-  helperText.style.display = 'none';
-  createBtn.style.display  = 'none';
-  createBtn.disabled       = false;
-}
-
-// ─── Capture helper ───────────────────────────────────────────────────────────
-// The XR swap-chain framebuffer is cleared after every present so toDataURL()
-// on renderer.domElement always reads blank. Instead:
-//   1. Re-render Daguerre into a plain WebGLRenderTarget and read its pixels.
-//   2. Read the XR camera texture (same texture the compositor shows) into a
-//      second pixel buffer via a temporary WebGL framebuffer.
-//   3. Composite camera -> Daguerre on a 2D canvas and return a data URL.
-function renderSceneToDataURL(camTexInfo) {
-  const w  = renderer.domElement.width;
-  const h  = renderer.domElement.height;
-  const gl = renderer.getContext();
-
-  // 1. Render Daguerre into an off-screen target.
-  const target = new THREE.WebGLRenderTarget(w, h, {
-    format: THREE.RGBAFormat,
-    type:   THREE.UnsignedByteType,
-    depthBuffer: false,
+document.getElementById('startBtn').addEventListener('click', () => {
+  ARProvider.start({
+    canvas: document.getElementById('camerafeed'),
+    onError: (msg) => showError('Impossible de demarrer la RA : ' + msg),
   });
-  renderer.setRenderTarget(target);
-  renderer.render(scene, camera);
-  renderer.setRenderTarget(null);
 
-  const dagPixels = new Uint8Array(w * h * 4);
-  renderer.readRenderTargetPixels(target, 0, 0, w, h, dagPixels);
-  target.dispose();
-
-  // 2. Read the XR camera texture via a temporary framebuffer.
-  let camCanvas = null;
-  if (camTexInfo?.texture) {
-    const { texture, width: cw, height: ch } = camTexInfo;
-    const fbo = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
-
-    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
-      const camPixels = new Uint8Array(cw * ch * 4);
-      gl.readPixels(0, 0, cw, ch, gl.RGBA, gl.UNSIGNED_BYTE, camPixels);
-
-      camCanvas = document.createElement('canvas');
-      camCanvas.width  = cw;
-      camCanvas.height = ch;
-      const camCtx  = camCanvas.getContext('2d');
-      const camData = camCtx.createImageData(cw, ch);
-      for (let row = 0; row < ch; row++) {  // Y-flip: WebGL origin is bottom-left
-        camData.data.set(
-          camPixels.subarray((ch - 1 - row) * cw * 4, (ch - row) * cw * 4),
-          row * cw * 4
-        );
-      }
-      camCtx.putImageData(camData, 0, 0);
-    }
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.deleteFramebuffer(fbo);
-  }
-
-  // 3. Composite: camera background then Daguerre on top.
-  const scratch = document.createElement('canvas');
-  scratch.width  = w;
-  scratch.height = h;
-  const ctx = scratch.getContext('2d');
-
-  if (camCanvas) {
-    const scale = Math.max(w / camCanvas.width, h / camCanvas.height); // cover
-    const dw    = camCanvas.width  * scale;
-    const dh    = camCanvas.height * scale;
-    ctx.drawImage(camCanvas, (w - dw) / 2, (h - dh) / 2, dw, dh);
-  }
-
-  // Y-flip Daguerre pixels; source-over compositing respects chroma-key alpha.
-  const daguCanvas = document.createElement('canvas');
-  daguCanvas.width  = w;
-  daguCanvas.height = h;
-  const daguCtx = daguCanvas.getContext('2d');
-  const dagData = daguCtx.createImageData(w, h);
-  for (let row = 0; row < h; row++) {
-    dagData.data.set(
-      dagPixels.subarray((h - 1 - row) * w * 4, (h - row) * w * 4),
-      row * w * 4
-    );
-  }
-  daguCtx.putImageData(dagData, 0, 0);
-  ctx.drawImage(daguCanvas, 0, 0);
-
-  return scratch.toDataURL('image/png');
-}
-
-// ─── XR frame loop ────────────────────────────────────────────────────────────
-
-function onXRFrame(timestamp, frame) {
-  if (!frame) { renderer.render(scene, camera); return; }
-
-  const refSpace = renderer.xr.getReferenceSpace();
-  const session  = renderer.xr.getSession();
-
-  if (!hitTestSourceRequested) {
-    session.requestReferenceSpace('viewer').then(vs => {
-      session.requestHitTestSource({ space: vs }).then(src => {
-        hitTestSource = src;
-      });
-    });
-    session.addEventListener('end', () => {
-      hitTestSource          = null;
-      hitTestSourceRequested = false;
-    });
-    hitTestSourceRequested = true;
-  }
-
-  if (!daguerrePlaced && hitTestSource) {
-    const results = frame.getHitTestResults(hitTestSource);
-    if (results.length > 0) {
-      const pose = results[0].getPose(refSpace);
-      reticle.visible = true;
-      reticle.matrix.fromArray(pose.transform.matrix);
-      if (placeBtn.disabled) {
-        placeBtn.disabled    = false;
-        scanHint.textContent = 'Sol detecte — appuyez pour placer';
-      }
-    } else {
-      reticle.visible      = false;
-      placeBtn.disabled    = true;
-      scanHint.textContent = 'Pointez vers le sol';
-    }
-  }
-
-  renderer.render(scene, camera);
-
-  if (captureNextFrame) {
-    captureNextFrame = false;
-
-    // Grab the XR camera image for this exact frame while we're still inside
-    // the frame callback (the texture is only valid within the same frame).
-    let camTexInfo = null;
-    if (xrBinding) {
-      const viewerPose = frame.getViewerPose(refSpace);
-      if (viewerPose) {
-        const view = viewerPose.views[0]; // single view in handheld AR
-        if (view?.camera) {
-          camTexInfo = {
-            texture: xrBinding.getCameraImage(view.camera),
-            width:   view.camera.width,
-            height:  view.camera.height,
-          };
-        }
-      }
-    }
-
-    const dataURL = renderSceneToDataURL(camTexInfo);
-    setTimeout(() => processDaguerreotype(dataURL), 30);
-  }
-}
-
+  startOverlay.style.display = 'none';
+  arUI.style.display         = 'flex';
+});
 </script>
 </body>
 </html>
