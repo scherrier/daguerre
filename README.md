@@ -1,25 +1,29 @@
 # Daguerre
 
-A single-file web AR experience that places Louis Daguerre — the inventor of photography — walking in the background of your device's live camera stream.
+A single-file WebXR experience that places Louis Daguerre — the inventor of photography — in the user's live camera feed, then lets them "develop" a still photo of the scene into a stylized daguerreotype.
 
 ## What it does
 
-When you open the page and tap the button, the rear camera fills the screen. A looping video of Daguerre walking is composited over it in real time, as if he were standing in the scene in front of you.
+Tap the button, point your phone at the ground to find a surface, then tap to place a life-size video of Daguerre there. He plays through a short walking animation once and freezes on his last frame. From there you can capture the scene — camera feed plus Daguerre composited together — and the app turns it into a vintage daguerreotype-style still you can save.
 
-## How the character is positioned
+## Platform support
 
-**Initial placement** — Daguerre is spawned at the horizontal center of the screen (`xFrac = 0.5`) and at 90 % of the screen height from the top (`yFrac = 0.9`), placing his feet near the bottom edge of the viewport.
+Placement and tracking use the WebXR Device API (`immersive-ar` session with the `hit-test` feature). **This currently only works in Chrome on Android (ARCore).** Safari on iOS does not implement WebXR, so there is no AR experience on iPhone yet.
 
-**Size** — His rendered height is `canvas.height × 0.30 × scale` (scale defaults to 3), making him roughly 90 % of the viewport tall. The image is drawn upward from his feet, so his head reaches close to the top of the screen.
+## How placement works
 
-**Direction** — He faces left (`dir = -1`); the canvas is mirrored horizontally when drawing him.
+A WebXR hit-test source continuously raycasts against detected real-world surfaces. While nothing is placed, a reticle tracks the ground under wherever the phone is pointed, and the "Placer Louis Daguerre ici" button enables once a surface is found. Tapping it bakes Daguerre's position and facing (rotated to face the camera at that moment) into a fixed transform — he's added to the AR scene in world space, not parented to the camera, so he stays put as you move around. That transform is set once and never recalculated.
 
-**Ground anchoring via device orientation** — At the moment the camera starts, the phone's heading and tilt (`alpha` / `beta` from the `deviceorientation` API) are recorded as the reference pose. On every subsequent frame, the deviation from that reference is converted into a screen-space offset using approximate camera field-of-view values (65 ° horizontal, 50 ° vertical). This makes Daguerre appear to stay fixed at one spot on the ground as you pan the phone. Exponential smoothing (factor 0.15) is applied to reduce jitter.
+## Daguerre character & green screen removal
 
-## Green screen removal
+`daguerre.mp4` is shot against a green background and rendered as a textured plane sized to a fixed real-world height (1.72 m). A custom shader removes the green per pixel every frame: it computes "greenness" (`g − max(r, b)`), uses `smoothstep` for soft anti-aliased edges, and caps the green channel to suppress spill on hair and clothing.
 
-The character video (`daguerre.mp4`) is shot against a green background. A tiny WebGL pipeline runs on the GPU every frame: a fragment shader computes per-pixel "greenness" (`g − max(r, b)`) and uses `smoothstep(0.01, 0.2, greenness)` to produce soft, anti-aliased edges. Green spill on hair and clothing is suppressed by capping the green channel at `max(r, b)` on every pixel. The result is drawn onto an offscreen canvas, which is then composited onto the main canvas at the character's screen position.
+The video plays once — it does not loop. When it ends, it holds on the last frame and reveals a helper message plus the "Créer un daguerréotype" button.
+
+## Capturing the daguerreotype
+
+Tapping "Créer un daguerréotype" grabs the current camera frame and the rendered AR scene, composites them together, and runs the result through a multi-pass filter: grayscale luminance extraction, blur-based local contrast, a bloom mask on highlights, a sigmoid tone-mapping curve with lifted blacks, monochrome grain, a silver-blue color tint, a vignette and center glow, and randomized scratch/dust marks — all applied uniformly across both the camera background and Daguerre. The result is shown full-screen with an option to save the image or resume.
 
 ## Usage
 
-Serve the directory over HTTPS (required for camera access on mobile), open the page, and tap **Rencontrer Louis Daguerre**.
+Serve the directory over HTTPS (required for camera and WebXR access on mobile), open the page in Chrome on Android, and tap **Rencontrer Louis Daguerre**.
