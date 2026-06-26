@@ -477,6 +477,7 @@ const daguerreMat = new THREE.ShaderMaterial({
 
 let daguerreMesh   = null;
 let daguerrePlaced = false;
+let cubePlaced = false;
 
 function buildDaguerreMesh() {
   if (daguerreMesh) return;
@@ -522,6 +523,27 @@ function placeDaguerre() {
   charVideo.play().catch(() => {});
 }
 
+function placeCube() {
+  const point = ARProvider.getReticlePoint();
+  if (!point || cubePlaced) return;
+  cubePlaced = true;
+
+  const geometry = new THREE.BoxGeometry(1, 1, 1);
+  const material = new THREE.MeshBasicMaterial({
+      color: 0x00ff00
+  });
+  const cubeMesh = new THREE.Mesh(geometry, material);
+
+  ARProvider.placeObjectInWorld(
+    cubeMesh,
+    { x: point.x, y: point.y, z: point.z },
+    0.0,
+  );
+
+  placeBtn.style.display    = 'none';
+  scanHint.style.display    = 'none';
+}
+
 // ─── UI references ────────────────────────────────────────────────────────────
 
 const startOverlay   = document.getElementById('start-overlay');
@@ -539,8 +561,9 @@ const saveBtn         = document.getElementById('saveBtn');
 const resumeBtn       = document.getElementById('resumeBtn');
 
 placeBtn.addEventListener('click', () => {
-  charVideo.play().catch(() => {});
-  placeDaguerre();
+  // charVideo.play().catch(() => {});
+  // placeDaguerre();
+  placeCube();
 });
 
 recenterBtn.addEventListener('click', () => {
