@@ -408,9 +408,21 @@ const ARProvider = (() => {
       trackingReticle      = false;
       reticleMesh.visible  = false;
 
-      object3D.matrixAutoUpdate = false;
-      object3D.matrix.makeRotationY(rotationY).setPosition(position.x, position.y, position.z);
-      scene.add(object3D);
+      const anchor = new THREE.Group();
+
+      anchor.position.set(
+          position.x,
+          position.y,
+          position.z
+      );
+
+      anchor.rotation.y = rotationY;
+
+      anchor.add(object3D);
+
+      scene.add(anchor);
+
+      return anchor;
     },
 
     // Captures the composited camera + AR scene on the next rendered frame.
