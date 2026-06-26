@@ -198,7 +198,7 @@
       width: 100%;
     }
 
-    #resumeBtn {
+    #resumeBtn, .ar-text-button {
       color: rgba(255, 255, 255, 0.75);
       font-family: "Inter", system-ui, sans-serif;
       font-size: 15px;
@@ -209,6 +209,11 @@
       pointer-events: auto;
       padding: 8px 20px;
       -webkit-tap-highlight-color: transparent;
+    }
+
+    .ar-text-button {
+      margin-top: 14px;
+      text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
     }
   </style>
 </head>
@@ -226,6 +231,7 @@
   <!-- Phase 1: scanning + placement -->
   <p id="scan-hint">Pointez vers le sol</p>
   <button id="placeBtn" class="ar-cta-button" disabled>Placer Louis Daguerre ici</button>
+  <button id="recenterBtn" class="ar-text-button">Le suivi tremble ? Recentrer</button>
 
   <!-- Phase 2: after video ends — helper text uses its own fixed position -->
   <p id="helperText" class="daguerre-helper-text" style="display:none">
@@ -400,6 +406,12 @@ const ARProvider = (() => {
 
     // Captures the composited camera + AR scene on the next rendered frame.
     requestCapture(cb) { pendingCapture = cb; },
+
+    // Resets SLAM tracking to treat the current camera pose as the new
+    // origin. Only safe before placement — calling it afterwards would
+    // redefine the world frame out from under the placed object and make
+    // it jump. Useful when tracking starts on a feature-poor/dark surface.
+    recenter() { XR8.XrController.recenter(); },
   };
 })();
 
@@ -483,8 +495,9 @@ function placeDaguerre() {
     theta,
   );
 
-  placeBtn.style.display = 'none';
-  scanHint.style.display = 'none';
+  placeBtn.style.display    = 'none';
+  scanHint.style.display    = 'none';
+  recenterBtn.style.display = 'none';
 
   charVideo.play().catch(() => {});
 }
@@ -495,6 +508,7 @@ const startOverlay   = document.getElementById('start-overlay');
 const arUI            = document.getElementById('ar-ui');
 const scanHint        = document.getElementById('scan-hint');
 const placeBtn        = document.getElementById('placeBtn');
+const recenterBtn     = document.getElementById('recenterBtn');
 const helperText      = document.getElementById('helperText');
 const createBtn       = document.getElementById('createBtn');
 const errMsg          = document.getElementById('errMsg');
@@ -507,6 +521,10 @@ const resumeBtn       = document.getElementById('resumeBtn');
 placeBtn.addEventListener('click', () => {
   charVideo.play().catch(() => {});
   placeDaguerre();
+});
+
+recenterBtn.addEventListener('click', () => {
+  ARProvider.recenter();
 });
 
 ARProvider.onReticleVisibilityChange((visible) => {
