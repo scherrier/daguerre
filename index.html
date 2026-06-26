@@ -497,7 +497,6 @@ function placeDaguerre() {
 
   placeBtn.style.display    = 'none';
   scanHint.style.display    = 'none';
-  recenterBtn.style.display = 'none';
 
   charVideo.play().catch(() => {});
 }
@@ -542,6 +541,7 @@ createBtn.addEventListener('click', () => {
   processingCapture = true;
   createBtn.disabled = true;
   loadingOverlay.style.display = 'flex';
+  recenterBtn.style.display = 'none';
 
   ARProvider.requestCapture((dataURL) => {
     setTimeout(() => processDaguerreotype(dataURL), 30);
@@ -562,6 +562,7 @@ resumeBtn.addEventListener('click', () => {
   resultOverlay.style.display = 'none';
   createBtn.disabled          = false;
   processingCapture           = false;
+  recenterBtn.style.display   = 'block';
 });
 
 function loadImage(src) {
@@ -570,16 +571,6 @@ function loadImage(src) {
     img.onload = () => resolve(img);
     img.src = src;
   });
-}
-
-// Yields control back to the browser between heavy synchronous passes below.
-// Without this, processDaguerreotype's filter pipeline blocks the main thread
-// for one long stretch — and since 8th Wall's SLAM tracking also runs on the
-// main thread, that stall starves it of camera-pose updates. When it resumes
-// it has lost continuity, which is what makes Daguerre appear to jump/drift
-// once you move the camera again after a capture.
-function nextFrame() {
-  return new Promise(resolve => setTimeout(resolve, 0));
 }
 
 async function processDaguerreotype(dataURL) {
@@ -616,7 +607,6 @@ async function processDaguerreotype(dataURL) {
   for (let i = 0, p = 0; i < d.length; i += 4, p++) {
     gray[p] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
   }
-  await nextFrame();
 
   // ── Build a blurred copy of the grayscale image (local contrast base) ─────
   // We draw the gray image to an offscreen canvas, apply a CSS blur filter,
@@ -643,7 +633,6 @@ async function processDaguerreotype(dataURL) {
   blurCtx.filter = 'blur(12px)';
   blurCtx.drawImage(grayCanvas, 0, 0);
   const blurData = blurCtx.getImageData(0, 0, w, h).data;
-  await nextFrame();
 
   // ── Build bloom mask: bright pixels only, then blur for soft glow ─────────
   const BLOOM_THRESH = 0.72;
@@ -669,7 +658,6 @@ async function processDaguerreotype(dataURL) {
   const bloomBlurCtx = bloomBlur.getContext('2d');
   bloomBlurCtx.filter = 'blur(22px)';
   bloomBlurCtx.drawImage(bloomSrc, 0, 0);
-  await nextFrame();
 
   // ── Pass 2: S-curve + local contrast + grain + silver-blue tint ──────────
   // All operations run on the already-composited image (camera + Daguerre
@@ -696,7 +684,6 @@ async function processDaguerreotype(dataURL) {
     d[i + 3] = 255;
   }
   c.putImageData(raw, 0, 0);
-  await nextFrame();
 
   // ── Highlight bloom: screen-blend the blurred bright mask ────────────────
   c.globalCompositeOperation = 'screen';
@@ -722,7 +709,6 @@ async function processDaguerreotype(dataURL) {
   glow.addColorStop(1, 'rgba(0,0,0,0)');
   c.fillStyle = glow;
   c.fillRect(0, 0, w, h);
-  await nextFrame();
 
   // ── Plate imperfections ───────────────────────────────────────────────────
   c.save();
