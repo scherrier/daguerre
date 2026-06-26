@@ -317,18 +317,18 @@ const ARProvider = (() => {
         // Invisible stand-in for "the ground" — there's no real surface
         // detection, this plane is always at y=0 regardless of where the
         // actual floor is in the camera image.
-        ground = new THREE.Mesh(
-          new THREE.PlaneGeometry(100, 100),
-          new THREE.MeshBasicMaterial({ visible: false }),
-        );
-        ground.rotateX(-Math.PI / 2);
-        scene.add(ground);
+        // ground = new THREE.Mesh(
+        //   new THREE.PlaneGeometry(100, 100),
+        //   new THREE.MeshBasicMaterial({ visible: false }),
+        // );
+        // ground.rotateX(-Math.PI / 2);
+        // scene.add(ground);
 
-        camera.position.set(0, EYE_HEIGHT, 0);
-        XR8.XrController.updateCameraProjectionMatrix({
-          origin: camera.position,
-          facing: camera.quaternion,
-        });
+        // camera.position.set(0, EYE_HEIGHT, 0);
+        // XR8.XrController.updateCameraProjectionMatrix({
+        //   origin: camera.position,
+        //   facing: camera.quaternion,
+        // });
       },
 
       // Runs every frame before rendering. Only updates the reticle before
@@ -336,20 +336,29 @@ const ARProvider = (() => {
       onUpdate: () => {
         if (!trackingReticle) return;
 
-        raycaster.setFromCamera({ x: 0, y: 0 }, camera);
-        const hits = raycaster.intersectObject(ground);
-        const wasVisible = reticleMesh.visible;
+        const dir = new THREE.Vector3(0, 0, -1);
+        dir.applyQuaternion(camera.quaternion);
+        reticlePoint = camera.position.clone().add(
+            dir.multiplyScalar(2.0)
+        );
+        reticleMesh.visible = true;
+        reticleMesh.matrix.identity().setPosition(reticlePoint);
+        visibilityCb?.(reticleMesh.visible)
 
-        if (hits.length && hits[0].distance < 6) {
-          reticlePoint = hits[0].point.clone();
-          reticleMesh.visible = true;
-          reticleMesh.matrix.identity().setPosition(reticlePoint);
-        } else {
-          reticlePoint = null;
-          reticleMesh.visible = false;
-        }
+        // raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+        // const hits = raycaster.intersectObject(ground);
+        // const wasVisible = reticleMesh.visible;
 
-        if (reticleMesh.visible !== wasVisible) visibilityCb?.(reticleMesh.visible);
+        // if (hits.length && hits[0].distance < 6) {
+        //   reticlePoint = hits[0].point.clone();
+        //   reticleMesh.visible = true;
+        //   reticleMesh.matrix.identity().setPosition(reticlePoint);
+        // } else {
+        //   reticlePoint = null;
+        //   reticleMesh.visible = false;
+        // }
+
+        // if (reticleMesh.visible !== wasVisible) visibilityCb?.(reticleMesh.visible);
       },
 
       // Runs every frame after the camera feed + three.js scene have been
